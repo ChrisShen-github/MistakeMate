@@ -18,6 +18,15 @@ docker compose up -d --build
 
 打开 `http://localhost:8080`。
 
+## 本地 OCR
+
+上传图片、PDF、HEIC 或 HEIF 后，MistakeMate 会在后台使用 PaddleOCR 3.7 和 PP-OCRv6 进行本地识别。题图不会发送到第三方 OCR 服务。
+
+- 首次识别需要下载约数百 MB 的模型，耗时取决于网络速度；后续会直接复用缓存。
+- 模型保存在项目的 `models/` 目录，原图保存在 `storage/`，数据库保存在 `postgres-data/`。这三个运行目录都不会提交到 Git。
+- CPU 识别时应用容器通常需要约 1 GB 内存。手写、公式和图形题仍应结合原图人工核对；当前 OCR 文本是可继续编辑和拆题的初稿。
+- 识别失败时，可在错题详情页直接重试。
+
 ## 自动发布到 Docker Hub
 
 仓库已配置 GitHub Actions：每次推送到 `main` 都会自动发布以下镜像标签：

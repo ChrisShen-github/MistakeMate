@@ -39,6 +39,7 @@ frontend/dist/
 # Runtime data, generated files, and local storage
 uploads/
 storage/
+models/
 data/
 postgres-data/
 redis-data/

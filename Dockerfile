@@ -12,7 +12,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y nginx \
+    && apt-get install --no-install-recommends -y \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        nginx \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

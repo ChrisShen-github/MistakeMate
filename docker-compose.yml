@@ -7,8 +7,10 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://mistakemate:${POSTGRES_PASSWORD:-mistakemate_local_only}@postgresql:5432/mistakemate
       STORAGE_ROOT: /app/storage
+      PADDLE_PDX_MODEL_SOURCE: BOS
     volumes:
       - ./storage:/app/storage
+      - ./models:/root/.paddlex
     depends_on:
       - postgresql
     restart: unless-stopped

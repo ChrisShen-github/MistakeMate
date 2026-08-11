@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import os
 import shutil
+import json
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
+from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -60,6 +64,19 @@ class UploadedFile(Base):
     batch: Mapped[UploadBatch] = relationship(back_populates="files")
 
 
+class OcrRun(Base):
+    __tablename__ = "ocr_runs"
+
+    batch_id: Mapped[str] = mapped_column(ForeignKey("upload_batches.id"), primary_key=True)
+    engine: Mapped[str] = mapped_column(String(64), default="PaddleOCR PP-OCRv6")
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    text: Mapped[str] = mapped_column(Text, default="")
+    raw_result: Mapped[str] = mapped_column(Text, default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class UploadResponse(BaseModel):
     id: str
     status: str
@@ -83,8 +100,142 @@ class UploadedFileResponse(BaseModel):
     size: int
 
 
+class OcrRunResponse(BaseModel):
+    engine: str
+    status: str
+    text: str
+    error_message: str
+    started_at: datetime | None
+    completed_at: datetime | None
+
+
 class MistakeBatchDetailResponse(MistakeBatchResponse):
     files: list[UploadedFileResponse]
+    ocr: OcrRunResponse | None
+
+
+ocr_model: Any | None = None
+ocr_model_lock = Lock()
+
+
+def to_ocr_response(run: OcrRun | None) -> OcrRunResponse | None:
+    if run is None:
+        return None
+    return OcrRunResponse(
+        engine=run.engine,
+        status=run.status,
+        text=run.text,
+        error_message=run.error_message,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
+    )
+
+
+def get_ocr_model() -> Any:
+    global ocr_model
+    with ocr_model_lock:
+        if ocr_model is None:
+            from paddleocr import PaddleOCR
+
+            ocr_model = PaddleOCR(
+                use_doc_orientation_classify=True,
+                use_doc_unwarping=True,
+                use_textline_orientation=True,
+                enable_mkldnn=False,
+                engine="paddle",
+            )
+    return ocr_model
+
+
+def prepare_ocr_inputs(source: Path, original_name: str, temporary_directory: Path) -> list[Path]:
+    extension = Path(original_name).suffix.lower()
+    if extension == ".pdf":
+        import fitz
+
+        document = fitz.open(source)
+        pages: list[Path] = []
+        try:
+            for index, page in enumerate(document):
+                target = temporary_directory / f"{source.stem}-{index + 1}.png"
+                page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).save(target)
+                pages.append(target)
+        finally:
+            document.close()
+        return pages
+    if extension in {".heic", ".heif"}:
+        from pillow_heif import register_heif_opener
+        from PIL import Image
+
+        register_heif_opener()
+        target = temporary_directory / f"{source.stem}.png"
+        Image.open(source).convert("RGB").save(target, "PNG")
+        return [target]
+    return [source]
+
+
+def result_to_dict(result: Any) -> dict[str, Any]:
+    payload = getattr(result, "json", None)
+    if callable(payload):
+        payload = payload()
+    if isinstance(payload, str):
+        return json.loads(payload)
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(result, dict):
+        return result
+    return json.loads(json.dumps(result, default=str))
+
+
+def run_ocr(batch_id: str) -> None:
+    with SessionLocal.begin() as session:
+        batch = session.get(UploadBatch, batch_id)
+        run = session.get(OcrRun, batch_id)
+        if batch is None or run is None:
+            return
+        batch.status = "recognizing"
+        run.status = "running"
+        run.error_message = ""
+        run.text = ""
+        run.raw_result = ""
+        run.started_at = datetime.now(timezone.utc)
+        run.completed_at = None
+        files = [(file.id, file.original_name, file.stored_name) for file in batch.files]
+
+    try:
+        model = get_ocr_model()
+        results: list[dict[str, Any]] = []
+        text_lines: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="mistakemate-ocr-") as temporary_path:
+            temporary_directory = Path(temporary_path)
+            for _, original_name, stored_name in files:
+                source = storage_root / "uploads" / batch_id / stored_name
+                for input_path in prepare_ocr_inputs(source, original_name, temporary_directory):
+                    for result in model.predict(str(input_path)):
+                        payload = result_to_dict(result)
+                        results.append(payload)
+                        recognized = payload.get("res", payload).get("rec_texts", [])
+                        text_lines.extend(str(line) for line in recognized if str(line).strip())
+
+        with SessionLocal.begin() as session:
+            batch = session.get(UploadBatch, batch_id)
+            run = session.get(OcrRun, batch_id)
+            if batch is None or run is None:
+                return
+            batch.status = "review_ready"
+            run.status = "completed"
+            run.text = "\n".join(text_lines)
+            run.raw_result = json.dumps(results, ensure_ascii=False)
+            run.completed_at = datetime.now(timezone.utc)
+    except Exception as error:
+        with SessionLocal.begin() as session:
+            batch = session.get(UploadBatch, batch_id)
+            run = session.get(OcrRun, batch_id)
+            if batch is None or run is None:
+                return
+            batch.status = "ocr_failed"
+            run.status = "failed"
+            run.error_message = str(error)[:2000]
+            run.completed_at = datetime.now(timezone.utc)
 
 
 @asynccontextmanager
@@ -151,6 +302,7 @@ def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
         if batch is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这组错题。")
         files = list(batch.files)
+        ocr = to_ocr_response(session.get(OcrRun, batch_id))
 
     return MistakeBatchDetailResponse(
         id=batch.id,
@@ -169,6 +321,7 @@ def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
             )
             for file in files
         ],
+        ocr=ocr,
     )
 
 
@@ -185,8 +338,31 @@ def get_uploaded_file(batch_id: str, file_id: str) -> FileResponse:
     return FileResponse(path, media_type=file.content_type)
 
 
+@app.post("/api/mistakes/{batch_id}/ocr", response_model=OcrRunResponse, status_code=status.HTTP_202_ACCEPTED)
+def request_ocr(batch_id: str, background_tasks: BackgroundTasks) -> OcrRunResponse:
+    with SessionLocal.begin() as session:
+        batch = session.get(UploadBatch, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这组错题。")
+        run = session.get(OcrRun, batch_id)
+        if run is None:
+            run = OcrRun(batch_id=batch_id)
+            session.add(run)
+        batch.status = "queued"
+        run.status = "queued"
+        run.error_message = ""
+        run.text = ""
+        run.raw_result = ""
+        run.started_at = None
+        run.completed_at = None
+
+    background_tasks.add_task(run_ocr, batch_id)
+    return to_ocr_response(run)
+
+
 @app.post("/api/uploads", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
 async def create_upload(
+    background_tasks: BackgroundTasks,
     subject: str = Form(..., min_length=1, max_length=32),
     source: str = Form(..., min_length=1, max_length=32),
     note: str = Form("", max_length=2000),
@@ -242,6 +418,7 @@ async def create_upload(
                     files=file_records,
                 )
             )
+            session.add(OcrRun(batch_id=batch_id))
     except HTTPException:
         shutil.rmtree(batch_directory, ignore_errors=True)
         raise
@@ -249,4 +426,5 @@ async def create_upload(
         shutil.rmtree(batch_directory, ignore_errors=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="文件保存失败，请稍后重试。") from error
 
+    background_tasks.add_task(run_ocr, batch_id)
     return UploadResponse(id=batch_id, status="queued", file_count=len(file_records))

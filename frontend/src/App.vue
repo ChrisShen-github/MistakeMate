@@ -19,6 +19,7 @@ import {
   Upload,
   X,
 } from '@lucide/vue'
+import UploadWorkspace from './components/UploadWorkspace.vue'
 
 type NavItem = {
   label: string
@@ -33,9 +34,9 @@ const navigation: NavItem[] = [
 ]
 
 const activeNav = ref('今日任务')
+const currentView = ref<'dashboard' | 'upload'>('dashboard')
 const sidebarOpen = ref(false)
 const notice = ref('')
-const fileInput = ref<HTMLInputElement | null>(null)
 const isStartingReview = ref(false)
 
 const questions = [
@@ -60,16 +61,14 @@ function showNotice(message: string) {
 }
 
 function openUpload() {
-  fileInput.value?.click()
+  currentView.value = 'upload'
+  sidebarOpen.value = false
 }
 
-function onFileSelected(event: Event) {
-  const input = event.target as HTMLInputElement
-  const total = input.files?.length ?? 0
-  if (total > 0) {
-    showNotice(`已选中 ${total} 个文件，上传功能将在后端接入后启用。`)
-  }
-  input.value = ''
+function selectNav(label: string) {
+  activeNav.value = label
+  currentView.value = 'dashboard'
+  sidebarOpen.value = false
 }
 
 function startReview() {
@@ -79,6 +78,10 @@ function startReview() {
     isStartingReview.value = false
     showNotice('今日复练已开始，第一题将从分数加减法开始。')
   }, 500)
+}
+
+function onRecognitionQueued(count: number) {
+  showNotice(`已准备识别 ${count} 个文件，下一步将进入题目检查。`)
 }
 </script>
 
@@ -96,7 +99,6 @@ function startReview() {
         <Upload :size="18" />
         上传错题
       </button>
-      <input ref="fileInput" class="sr-only" type="file" accept="image/*,.pdf" multiple @change="onFileSelected" />
 
       <nav class="nav-list">
         <button
@@ -105,7 +107,7 @@ function startReview() {
           class="nav-item"
           :class="{ active: activeNav === item.label }"
           :aria-current="activeNav === item.label ? 'page' : undefined"
-          @click="activeNav = item.label; sidebarOpen = false"
+          @click="selectNav(item.label)"
         >
           <component :is="item.icon" :size="19" />
           {{ item.label }}
@@ -127,14 +129,16 @@ function startReview() {
     <main id="main-content" class="main-content" tabindex="-1">
       <header class="topbar">
         <button class="mobile-menu icon-button" aria-label="打开导航" @click="sidebarOpen = true"><Menu :size="21" /></button>
-        <div class="crumb"><span>陈晨的错题本</span><ChevronRight :size="15" /><strong>{{ activeNav }}</strong></div>
+        <div class="crumb"><span>陈晨的错题本</span><ChevronRight :size="15" /><strong>{{ currentView === 'upload' ? '上传错题' : activeNav }}</strong></div>
         <div class="top-actions">
           <button class="bell icon-button" aria-label="查看提醒" @click="showNotice('今天有 8 道题等待复练。')"><Bell :size="20" /><i></i></button>
           <button class="profile" @click="showNotice('孩子档案设置将在后续开放。')"><div class="avatar">晨</div><span>陈晨</span></button>
         </div>
       </header>
 
-      <section class="dashboard">
+      <UploadWorkspace v-if="currentView === 'upload'" @back="currentView = 'dashboard'" @queued="onRecognitionQueued" />
+
+      <section v-else class="dashboard">
         <div class="welcome-row">
           <div>
             <p class="eyebrow">星期二 · 8 月 11 日</p>

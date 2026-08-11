@@ -7,8 +7,8 @@
 ---
 
 **Project:** MistakeMate
-**Generated:** 2026-08-11 12:06:03
-**Category:** General
+**Generated:** 2026-08-11 13:16:42
+**Category:** Translator App
 
 ---
 
@@ -28,7 +28,7 @@
 
 - **Heading Font:** Inter
 - **Body Font:** Inter
-- **Mood:** Professional + Hierarchy
+- **Mood:** Bold + Clean + Sans-serif
 
 ### Spacing Variables
 
@@ -145,17 +145,17 @@
 
 ## Style Guidelines
 
-**Style:** Glassmorphism
+**Style:** Flat Design
 
-**Keywords:** Frosted glass, transparent, blurred background, layered, vibrant background, light source, depth, multi-layer
+**Keywords:** 2D, minimalist, bold colors, no shadows, clean lines, simple shapes, typography-focused, modern, icon-heavy
 
-**Best For:** Modern SaaS, financial dashboards, high-end corporate, lifestyle apps, modal overlays, navigation
+**Best For:** Web apps, mobile apps, cross-platform, startup MVPs, user-friendly, SaaS, dashboards, corporate
 
-**Key Effects:** Backdrop blur (10-20px), subtle border (1px solid rgba white 0.2), light reflection, Z-depth
+**Key Effects:** No gradients/shadows, simple hover (color/opacity shift), fast loading, clean transitions (150-200ms ease), minimal icons
 
 ### Page Pattern
 
-**Pattern Name:** Hero + Features + CTA
+**Pattern Name:** Feature-Rich Showcase + Interactive Demo
 
 - **CTA Placement:** Above fold
 - **Section Order:** Hero > Features > CTA
@@ -164,8 +164,8 @@
 
 ## Anti-Patterns (Do NOT Use)
 
-- ❌ Excessive animation
-- ❌ Dark mode by default
+- ❌ Complex shadows
+- ❌ 3D effects
 
 ### Additional Forbidden Patterns
 

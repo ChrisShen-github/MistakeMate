@@ -81,7 +81,7 @@ function startReview() {
 }
 
 function onRecognitionQueued(count: number) {
-  showNotice(`已准备识别 ${count} 个文件，下一步将进入题目检查。`)
+  showNotice(`已上传 ${count} 个文件，下一步将进入题目检查。`)
 }
 </script>
 

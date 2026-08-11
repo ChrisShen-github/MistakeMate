@@ -10,6 +10,7 @@ const isSubmitting = ref(false)
 const errorMessage = ref('')
 const subject = ref('数学')
 const source = ref('作业')
+const note = ref('')
 const canSubmit = computed(() => files.value.length > 0 && !isSubmitting.value)
 
 function chooseFiles() { input.value?.click() }
@@ -25,7 +26,28 @@ function onInputChange(event: Event) { const target = event.target as HTMLInputE
 function onDrop(event: DragEvent) { isDragging.value = false; if (event.dataTransfer?.files) addFiles(event.dataTransfer.files) }
 function removeFile(index: number) { files.value.splice(index, 1); errorMessage.value = '' }
 function formatSize(size: number) { return size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / 1024 / 1024).toFixed(1)} MB` }
-function queueRecognition() { if (!canSubmit.value) return; isSubmitting.value = true; window.setTimeout(() => { isSubmitting.value = false; emit('queued', files.value.length) }, 650) }
+async function queueRecognition() {
+  if (!canSubmit.value) return
+  isSubmitting.value = true
+  errorMessage.value = ''
+  const formData = new FormData()
+  formData.set('subject', subject.value)
+  formData.set('source', source.value)
+  formData.set('note', note.value.trim())
+  files.value.forEach((file) => formData.append('files', file))
+  try {
+    const response = await fetch('/api/uploads', { method: 'POST', body: formData })
+    const payload = await response.json().catch(() => ({ detail: '上传失败，请稍后重试。' }))
+    if (!response.ok) throw new Error(payload.detail)
+    const count = payload.file_count as number
+    files.value = []
+    emit('queued', count)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '上传失败，请稍后重试。'
+  } finally {
+    isSubmitting.value = false
+  }
+}
 </script>
 
 <template>
@@ -44,7 +66,7 @@ function queueRecognition() { if (!canSubmit.value) return; isSubmitting.value =
         <div v-if="files.length" class="file-list" aria-label="待识别文件"><article v-for="(file, index) in files" :key="`${file.name}-${file.size}`" class="file-row"><div class="file-icon"><FileText v-if="file.type === 'application/pdf'" :size="20" /><FileImage v-else :size="20" /></div><div class="file-info"><strong>{{ file.name }}</strong><span>{{ formatSize(file.size) }} · 等待识别</span></div><button class="remove-button" type="button" :aria-label="`移除 ${file.name}`" @click="removeFile(index)"><Trash2 :size="17" /></button></article></div>
       </section>
       <aside class="details-column">
-        <section class="details-card" aria-labelledby="details-heading"><div class="section-title"><div><p class="section-kicker">第二步</p><h2 id="details-heading">补充一点信息</h2></div></div><p class="details-tip">这能让 AI 更准确地判断知识点。其余信息可在识别后再修改。</p><div class="form-grid"><label>学科<select v-model="subject"><option>数学</option><option>语文</option><option>英语</option><option>其他</option></select></label><label>题目来源<select v-model="source"><option>作业</option><option>试卷</option><option>练习册</option><option>其他</option></select></label></div><label class="note-label">给自己留个备注 <span>可选</span><textarea placeholder="例如：第 2 单元周测，孩子说这题当时没看懂。"></textarea></label></section>
+        <section class="details-card" aria-labelledby="details-heading"><div class="section-title"><div><p class="section-kicker">第二步</p><h2 id="details-heading">补充一点信息</h2></div></div><p class="details-tip">这能让 AI 更准确地判断知识点。其余信息可在识别后再修改。</p><div class="form-grid"><label>学科<select v-model="subject"><option>数学</option><option>语文</option><option>英语</option><option>其他</option></select></label><label>题目来源<select v-model="source"><option>作业</option><option>试卷</option><option>练习册</option><option>其他</option></select></label></div><label class="note-label">给自己留个备注 <span>可选</span><textarea v-model="note" placeholder="例如：第 2 单元周测，孩子说这题当时没看懂。"></textarea></label></section>
         <section class="privacy-note"><LockKeyhole :size="19" /><div><strong>题目只用于生成你的错题本</strong><p>原图会保留，AI 识别结果可随时修改或删除。</p></div></section>
       </aside>
     </div>

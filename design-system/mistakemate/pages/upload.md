@@ -36,7 +36,14 @@
 
 ## Page-Specific Components
 
-- No unique components for this page
+### OCR Crop Dialog
+
+- Desktop uses a centered modal up to 960px; phone uses a bottom-aligned full-width sheet without horizontal scrolling.
+- Keep the image on a dark neutral canvas and use the existing orange accent only for the crop boundary and confirmation action.
+- Provide eight visible resize handles, drag-to-move, drag-outside-to-redraw, arrow-key movement, and `Shift + Arrow` resizing.
+- Close, cancel, whole-image, and confirm controls must remain at least 44px high with visible keyboard focus.
+- Lock background scrolling and keep keyboard focus inside the dialog until it is closed.
+- Cropping changes only the OCR input region; the stored original image remains untouched.
 
 ---
 

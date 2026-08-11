@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import json
+import math
 import tempfile
 import time
 from collections.abc import AsyncIterator
@@ -17,7 +18,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, func, select
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -75,6 +76,16 @@ class OcrRun(Base):
     error_message: Mapped[str] = mapped_column(Text, default="")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OcrRegion(Base):
+    __tablename__ = "ocr_regions"
+
+    file_id: Mapped[str] = mapped_column(ForeignKey("uploaded_files.id"), primary_key=True)
+    x: Mapped[float] = mapped_column(Float)
+    y: Mapped[float] = mapped_column(Float)
+    width: Mapped[float] = mapped_column(Float)
+    height: Mapped[float] = mapped_column(Float)
 
 
 class UploadResponse(BaseModel):
@@ -147,7 +158,12 @@ def get_ocr_model() -> Any:
     return ocr_model
 
 
-def prepare_ocr_inputs(source: Path, original_name: str, temporary_directory: Path) -> list[Path]:
+def prepare_ocr_inputs(
+    source: Path,
+    original_name: str,
+    temporary_directory: Path,
+    crop_region: tuple[float, float, float, float] | None = None,
+) -> list[Path]:
     extension = Path(original_name).suffix.lower()
     if extension == ".pdf":
         import fitz
@@ -164,13 +180,60 @@ def prepare_ocr_inputs(source: Path, original_name: str, temporary_directory: Pa
         return pages
     if extension in {".heic", ".heif"}:
         from pillow_heif import register_heif_opener
-        from PIL import Image
 
         register_heif_opener()
-        target = temporary_directory / f"{source.stem}.png"
-        Image.open(source).convert("RGB").save(target, "PNG")
+    if extension in {".heic", ".heif"} or crop_region is not None:
+        from PIL import Image, ImageOps
+
+        target = temporary_directory / f"{source.stem}-prepared.png"
+        with Image.open(source) as image:
+            prepared = ImageOps.exif_transpose(image).convert("RGB")
+            if crop_region is not None:
+                x, y, width, height = crop_region
+                left = round(prepared.width * x)
+                top = round(prepared.height * y)
+                right = round(prepared.width * (x + width))
+                bottom = round(prepared.height * (y + height))
+                prepared = prepared.crop((left, top, right, bottom))
+            prepared.save(target, "PNG")
         return [target]
     return [source]
+
+
+def parse_crop_regions(value: str, file_count: int) -> list[tuple[float, float, float, float] | None]:
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="识别范围格式不正确。") from error
+    if payload == []:
+        return [None] * file_count
+    if not isinstance(payload, list) or len(payload) != file_count:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="识别范围与文件数量不一致。")
+
+    regions: list[tuple[float, float, float, float] | None] = []
+    for region in payload:
+        if region is None:
+            regions.append(None)
+            continue
+        if not isinstance(region, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="识别范围格式不正确。")
+        try:
+            coordinates = tuple(float(region[key]) for key in ("x", "y", "width", "height"))
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="识别范围缺少有效坐标。") from error
+        x, y, width, height = coordinates
+        if (
+            not all(math.isfinite(coordinate) for coordinate in coordinates)
+            or x < 0
+            or y < 0
+            or width < 0.03
+            or height < 0.03
+            or x + width > 1.0001
+            or y + height > 1.0001
+        ):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="识别范围超出图片边界或过小。")
+        regions.append((x, y, width, height))
+    return regions
 
 
 def result_to_dict(result: Any) -> dict[str, Any]:
@@ -199,7 +262,11 @@ def run_ocr(batch_id: str) -> None:
         run.raw_result = ""
         run.started_at = datetime.now(timezone.utc)
         run.completed_at = None
-        files = [(file.id, file.original_name, file.stored_name) for file in batch.files]
+        files = []
+        for file in batch.files:
+            region = session.get(OcrRegion, file.id)
+            crop_region = (region.x, region.y, region.width, region.height) if region else None
+            files.append((file.id, file.original_name, file.stored_name, crop_region))
 
     try:
         model = get_ocr_model()
@@ -207,9 +274,9 @@ def run_ocr(batch_id: str) -> None:
         text_lines: list[str] = []
         with tempfile.TemporaryDirectory(prefix="mistakemate-ocr-") as temporary_path:
             temporary_directory = Path(temporary_path)
-            for _, original_name, stored_name in files:
+            for _, original_name, stored_name, crop_region in files:
                 source = storage_root / "uploads" / batch_id / stored_name
-                for input_path in prepare_ocr_inputs(source, original_name, temporary_directory):
+                for input_path in prepare_ocr_inputs(source, original_name, temporary_directory, crop_region):
                     for result in model.predict(str(input_path)):
                         payload = result_to_dict(result)
                         results.append(payload)
@@ -366,20 +433,23 @@ async def create_upload(
     subject: str = Form(..., min_length=1, max_length=32),
     source: str = Form(..., min_length=1, max_length=32),
     note: str = Form("", max_length=2000),
+    crop_regions: str = Form("[]"),
     files: list[UploadFile] = File(...),
 ) -> UploadResponse:
     if not files:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请至少上传一个文件。")
     if len(files) > MAX_FILES_PER_BATCH:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"一次最多上传 {MAX_FILES_PER_BATCH} 个文件。")
+    parsed_crop_regions = parse_crop_regions(crop_regions, len(files))
 
     batch_id = str(uuid4())
     batch_directory = storage_root / "uploads" / batch_id
     batch_directory.mkdir(parents=True, exist_ok=False)
     file_records: list[UploadedFile] = []
+    region_records: list[OcrRegion] = []
 
     try:
-        for uploaded in files:
+        for file_index, uploaded in enumerate(files):
             original_name = uploaded.filename or "untitled"
             extension = Path(original_name).suffix.lower()
             content_type = uploaded.content_type or "application/octet-stream"
@@ -397,32 +467,43 @@ async def create_upload(
                         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"文件超过 20 MB：{original_name}")
                     target.write(chunk)
             await uploaded.close()
-            file_records.append(
-                UploadedFile(
-                    id=str(uuid4()),
-                    original_name=original_name[:255],
-                    stored_name=stored_name,
-                    content_type=content_type,
-                    size=size,
-                )
+            file_record = UploadedFile(
+                id=str(uuid4()),
+                original_name=original_name[:255],
+                stored_name=stored_name,
+                content_type=content_type,
+                size=size,
             )
+            file_records.append(file_record)
+            region = parsed_crop_regions[file_index]
+            if region is not None:
+                region_records.append(
+                    OcrRegion(
+                        file_id=file_record.id,
+                        x=region[0],
+                        y=region[1],
+                        width=region[2],
+                        height=region[3],
+                    )
+                )
 
         with SessionLocal.begin() as session:
-            session.add(
-                UploadBatch(
-                    id=batch_id,
-                    subject=subject.strip(),
-                    source=source.strip(),
-                    note=note.strip(),
-                    status="queued",
-                    files=file_records,
-                )
+            batch = UploadBatch(
+                id=batch_id,
+                subject=subject.strip(),
+                source=source.strip(),
+                note=note.strip(),
+                status="queued",
+                files=file_records,
             )
+            session.add(batch)
+            session.flush()
             session.add(OcrRun(batch_id=batch_id))
+            session.add_all(region_records)
     except HTTPException:
         shutil.rmtree(batch_directory, ignore_errors=True)
         raise
-    except OSError as error:
+    except Exception as error:
         shutil.rmtree(batch_directory, ignore_errors=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="文件保存失败，请稍后重试。") from error
 

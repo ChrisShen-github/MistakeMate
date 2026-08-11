@@ -23,6 +23,7 @@ docker compose up -d --build
 上传图片、PDF、HEIC 或 HEIF 后，MistakeMate 会在后台使用 PaddleOCR 3.7 和 PP-OCRv6 进行本地识别。题图不会发送到第三方 OCR 服务。
 
 - 首次识别需要下载约数百 MB 的模型，耗时取决于网络速度；后续会直接复用缓存。
+- JPG、PNG 和 WebP 图片可在上传前手动截取识别范围；系统只裁剪临时 OCR 输入，完整原图仍会保留。
 - 模型保存在项目的 `models/` 目录，原图保存在 `storage/`，数据库保存在 `postgres-data/`。这三个运行目录都不会提交到 Git。
 - CPU 识别时应用容器通常需要约 1 GB 内存。手写、公式和图形题仍应结合原图人工核对；当前 OCR 文本是可继续编辑和拆题的初稿。
 - 识别失败时，可在错题详情页直接重试。

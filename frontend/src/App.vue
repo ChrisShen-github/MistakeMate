@@ -21,6 +21,7 @@ import {
 } from '@lucide/vue'
 import UploadWorkspace from './components/UploadWorkspace.vue'
 import MistakeLibrary from './components/MistakeLibrary.vue'
+import BatchReview from './components/BatchReview.vue'
 
 type NavItem = {
   label: string
@@ -35,8 +36,9 @@ const navigation: NavItem[] = [
 ]
 
 const activeNav = ref('今日任务')
-const currentView = ref<'dashboard' | 'upload' | 'library'>('dashboard')
+const currentView = ref<'dashboard' | 'upload' | 'library' | 'review'>('dashboard')
 const previousView = ref<'dashboard' | 'library'>('dashboard')
+const activeBatchId = ref('')
 const sidebarOpen = ref(false)
 const notice = ref('')
 const isStartingReview = ref(false)
@@ -54,7 +56,7 @@ const subjects = [
 ]
 
 const activeTitle = computed(() => activeNav.value === '今日任务' ? '今天，先攻克最值得重做的题。' : activeNav.value)
-const currentCrumb = computed(() => currentView.value === 'upload' ? '上传错题' : currentView.value === 'library' ? '我的错题' : activeNav.value)
+const currentCrumb = computed(() => currentView.value === 'upload' ? '上传错题' : currentView.value === 'library' ? '我的错题' : currentView.value === 'review' ? '检查错题' : activeNav.value)
 
 function showNotice(message: string) {
   notice.value = message
@@ -78,6 +80,11 @@ function openLibrary() {
 function closeUpload() {
   currentView.value = previousView.value
   activeNav.value = previousView.value === 'library' ? '我的错题' : '今日任务'
+}
+
+function openBatch(batchId: string) {
+  activeBatchId.value = batchId
+  currentView.value = 'review'
 }
 
 function selectNav(label: string) {
@@ -154,7 +161,8 @@ function onRecognitionQueued(count: number) {
       </header>
 
       <UploadWorkspace v-if="currentView === 'upload'" @back="closeUpload" @queued="onRecognitionQueued" />
-      <MistakeLibrary v-else-if="currentView === 'library'" @upload="openUpload" @open="showNotice('该批错题正在等待识别，完成后可检查题目内容。')" />
+      <MistakeLibrary v-else-if="currentView === 'library'" @upload="openUpload" @open="openBatch($event.id)" />
+      <BatchReview v-else-if="currentView === 'review'" :batch-id="activeBatchId" @back="openLibrary" />
 
       <section v-else class="dashboard">
         <div class="welcome-row">

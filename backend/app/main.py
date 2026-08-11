@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, func, select
@@ -75,6 +76,17 @@ class MistakeBatchResponse(BaseModel):
     file_count: int
 
 
+class UploadedFileResponse(BaseModel):
+    id: str
+    original_name: str
+    content_type: str
+    size: int
+
+
+class MistakeBatchDetailResponse(MistakeBatchResponse):
+    files: list[UploadedFileResponse]
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     storage_root.mkdir(parents=True, exist_ok=True)
@@ -130,6 +142,47 @@ def list_mistakes(subject: str | None = None) -> list[MistakeBatchResponse]:
         )
         for batch, file_count in rows
     ]
+
+
+@app.get("/api/mistakes/{batch_id}", response_model=MistakeBatchDetailResponse)
+def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
+    with SessionLocal() as session:
+        batch = session.get(UploadBatch, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这组错题。")
+        files = list(batch.files)
+
+    return MistakeBatchDetailResponse(
+        id=batch.id,
+        subject=batch.subject,
+        source=batch.source,
+        note=batch.note,
+        status=batch.status,
+        created_at=batch.created_at,
+        file_count=len(files),
+        files=[
+            UploadedFileResponse(
+                id=file.id,
+                original_name=file.original_name,
+                content_type=file.content_type,
+                size=file.size,
+            )
+            for file in files
+        ],
+    )
+
+
+@app.get("/api/mistakes/{batch_id}/files/{file_id}")
+def get_uploaded_file(batch_id: str, file_id: str) -> FileResponse:
+    with SessionLocal() as session:
+        file = session.get(UploadedFile, file_id)
+        if file is None or file.batch_id != batch_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到原始文件。")
+        path = storage_root / "uploads" / batch_id / file.stored_name
+
+    if not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原始文件已不存在。")
+    return FileResponse(path, media_type=file.content_type)
 
 
 @app.post("/api/uploads", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)

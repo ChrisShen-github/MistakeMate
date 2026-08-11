@@ -91,7 +91,7 @@ function onRecognitionQueued(count: number) {
     <aside class="sidebar" :class="{ 'is-open': sidebarOpen }" aria-label="主导航">
       <div class="brand-row">
         <div class="brand-mark" aria-hidden="true"><GraduationCap :size="22" /></div>
-        <div class="brand-name">知错本<span>让错题有价值</span></div>
+        <div class="brand-name">MistakeMate<span>让错题有价值</span></div>
         <button class="mobile-close icon-button" aria-label="关闭导航" @click="sidebarOpen = false"><X :size="19" /></button>
       </div>
 

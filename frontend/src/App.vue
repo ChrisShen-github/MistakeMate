@@ -20,6 +20,7 @@ import {
   X,
 } from '@lucide/vue'
 import UploadWorkspace from './components/UploadWorkspace.vue'
+import MistakeLibrary from './components/MistakeLibrary.vue'
 
 type NavItem = {
   label: string
@@ -34,7 +35,8 @@ const navigation: NavItem[] = [
 ]
 
 const activeNav = ref('今日任务')
-const currentView = ref<'dashboard' | 'upload'>('dashboard')
+const currentView = ref<'dashboard' | 'upload' | 'library'>('dashboard')
+const previousView = ref<'dashboard' | 'library'>('dashboard')
 const sidebarOpen = ref(false)
 const notice = ref('')
 const isStartingReview = ref(false)
@@ -52,6 +54,7 @@ const subjects = [
 ]
 
 const activeTitle = computed(() => activeNav.value === '今日任务' ? '今天，先攻克最值得重做的题。' : activeNav.value)
+const currentCrumb = computed(() => currentView.value === 'upload' ? '上传错题' : currentView.value === 'library' ? '我的错题' : activeNav.value)
 
 function showNotice(message: string) {
   notice.value = message
@@ -61,13 +64,25 @@ function showNotice(message: string) {
 }
 
 function openUpload() {
+  previousView.value = currentView.value === 'library' ? 'library' : 'dashboard'
   currentView.value = 'upload'
   sidebarOpen.value = false
 }
 
+function openLibrary() {
+  activeNav.value = '我的错题'
+  currentView.value = 'library'
+  sidebarOpen.value = false
+}
+
+function closeUpload() {
+  currentView.value = previousView.value
+  activeNav.value = previousView.value === 'library' ? '我的错题' : '今日任务'
+}
+
 function selectNav(label: string) {
   activeNav.value = label
-  currentView.value = 'dashboard'
+  currentView.value = label === '我的错题' ? 'library' : 'dashboard'
   sidebarOpen.value = false
 }
 
@@ -81,6 +96,8 @@ function startReview() {
 }
 
 function onRecognitionQueued(count: number) {
+  activeNav.value = '我的错题'
+  currentView.value = 'library'
   showNotice(`已上传 ${count} 个文件，下一步将进入题目检查。`)
 }
 </script>
@@ -129,14 +146,15 @@ function onRecognitionQueued(count: number) {
     <main id="main-content" class="main-content" tabindex="-1">
       <header class="topbar">
         <button class="mobile-menu icon-button" aria-label="打开导航" @click="sidebarOpen = true"><Menu :size="21" /></button>
-        <div class="crumb"><span>陈晨的错题本</span><ChevronRight :size="15" /><strong>{{ currentView === 'upload' ? '上传错题' : activeNav }}</strong></div>
+        <div class="crumb"><span>陈晨的错题本</span><ChevronRight :size="15" /><strong>{{ currentCrumb }}</strong></div>
         <div class="top-actions">
           <button class="bell icon-button" aria-label="查看提醒" @click="showNotice('今天有 8 道题等待复练。')"><Bell :size="20" /><i></i></button>
           <button class="profile" @click="showNotice('孩子档案设置将在后续开放。')"><div class="avatar">晨</div><span>陈晨</span></button>
         </div>
       </header>
 
-      <UploadWorkspace v-if="currentView === 'upload'" @back="currentView = 'dashboard'" @queued="onRecognitionQueued" />
+      <UploadWorkspace v-if="currentView === 'upload'" @back="closeUpload" @queued="onRecognitionQueued" />
+      <MistakeLibrary v-else-if="currentView === 'library'" @upload="openUpload" @open="showNotice('该批错题正在等待识别，完成后可检查题目内容。')" />
 
       <section v-else class="dashboard">
         <div class="welcome-row">
@@ -186,7 +204,7 @@ function onRecognitionQueued(count: number) {
           <article class="panel question-panel">
             <div class="panel-heading">
               <div><p class="section-kicker">优先完成</p><h2>待复练的错题</h2></div>
-              <button class="text-button" @click="activeNav = '我的错题'">查看全部 <ChevronRight :size="16" /></button>
+              <button class="text-button" @click="openLibrary">查看全部 <ChevronRight :size="16" /></button>
             </div>
             <div class="question-list">
               <button v-for="question in questions" :key="question.title" class="question-row" @click="showNotice(`已打开：${question.title}`)">

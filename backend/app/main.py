@@ -12,7 +12,7 @@ from uuid import uuid4
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -65,6 +65,16 @@ class UploadResponse(BaseModel):
     file_count: int
 
 
+class MistakeBatchResponse(BaseModel):
+    id: str
+    subject: str
+    source: str
+    note: str
+    status: str
+    created_at: datetime
+    file_count: int
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     storage_root.mkdir(parents=True, exist_ok=True)
@@ -93,6 +103,33 @@ app.add_middleware(
 @app.get("/api/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/mistakes", response_model=list[MistakeBatchResponse])
+def list_mistakes(subject: str | None = None) -> list[MistakeBatchResponse]:
+    statement = (
+        select(UploadBatch, func.count(UploadedFile.id).label("file_count"))
+        .outerjoin(UploadedFile)
+        .group_by(UploadBatch.id)
+        .order_by(UploadBatch.created_at.desc())
+    )
+    if subject:
+        statement = statement.where(UploadBatch.subject == subject)
+
+    with SessionLocal() as session:
+        rows = session.execute(statement).all()
+    return [
+        MistakeBatchResponse(
+            id=batch.id,
+            subject=batch.subject,
+            source=batch.source,
+            note=batch.note,
+            status=batch.status,
+            created_at=batch.created_at,
+            file_count=file_count,
+        )
+        for batch, file_count in rows
+    ]
 
 
 @app.post("/api/uploads", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)

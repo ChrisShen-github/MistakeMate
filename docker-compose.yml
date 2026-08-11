@@ -1,28 +1,26 @@
 services:
-  frontend:
-    build:
-      context: ./frontend
+  mistakemate:
+    container_name: mistakemate
+    build: .
     ports:
-      - "8080:80"
-    depends_on:
-      backend:
-        condition: service_started
-    restart: unless-stopped
-
-  backend:
-    build:
-      context: ./backend
+      - "8080:8080"
     environment:
-      DATABASE_URL: postgresql+psycopg://mistakemate:${POSTGRES_PASSWORD:-mistakemate_local_only}@postgres:5432/mistakemate
+      DATABASE_URL: postgresql+psycopg://mistakemate:${POSTGRES_PASSWORD:-mistakemate_local_only}@postgresql:5432/mistakemate
       STORAGE_ROOT: /app/storage
     volumes:
       - ./storage:/app/storage
     depends_on:
-      postgres:
+      postgresql:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8080/api/health').status == 200"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
     restart: unless-stopped
 
-  postgres:
+  postgresql:
+    container_name: postgresql
     image: postgres:17-alpine
     environment:
       POSTGRES_DB: mistakemate

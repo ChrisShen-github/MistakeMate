@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
@@ -66,7 +68,14 @@ class UploadResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     storage_root.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(engine)
+    for attempt in range(30):
+        try:
+            Base.metadata.create_all(engine)
+            break
+        except OperationalError:
+            if attempt == 29:
+                raise
+            time.sleep(1)
     yield
     engine.dispose()
 

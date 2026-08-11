@@ -43,7 +43,6 @@ jobs:
           images: ${{ vars.DOCKERHUB_USERNAME }}/mistakemate
           tags: |
             type=raw,value=latest
-            type=sha,format=short,prefix=sha-
 
       - name: Build and push image
         uses: docker/build-push-action@v7

@@ -23,7 +23,6 @@ docker compose up -d --build
 仓库已配置 GitHub Actions：每次推送到 `main` 都会自动发布以下镜像标签：
 
 - `docker.io/<你的 Docker Hub 用户名>/mistakemate:latest`
-- `docker.io/<你的 Docker Hub 用户名>/mistakemate:sha-<短提交号>`
 
 首次启用前，在 Docker Hub 创建一个名为 `mistakemate` 的仓库，并在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 中添加：
 

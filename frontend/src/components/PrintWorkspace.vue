@@ -8,8 +8,6 @@ import {
   FileText,
   LayoutTemplate,
   LoaderCircle,
-  Minus,
-  Plus,
   Printer,
   RefreshCw,
   Save,
@@ -82,7 +80,7 @@ const standardSettings: PrintSettings = {
   paperId: 'A4', customWidth: 210, customHeight: 297, orientation: 'portrait',
   margins: { top: 12, right: 12, bottom: 10, left: 12 }, columns: 1,
   fontSize: 11, lineHeight: 1.75, questionGap: 5, defaultAnswerLines: 4,
-  showAnswers: false, showAnswerLines: true, showHeader: true, showFooter: true,
+  showAnswers: false, showAnswerLines: false, showHeader: true, showFooter: true,
   showQuestionDivider: true, showQuestionNumbers: true, showMeta: true, showDifficulty: true, showDate: false,
   showScoreFields: true, a4B5Imposition: false, showCropMarks: true,
   bindingMargin: 0, showBindingGuide: false,
@@ -99,10 +97,10 @@ function cloneSettings(value: Partial<PrintSettings>): PrintSettings {
 
 const builtInTemplates: TemplateDefinition[] = [
   { id: 'standard', name: '标准练习', description: 'A4 单栏，适合日常重练', settings: cloneSettings(standardSettings) },
-  { id: 'calculation', name: '计算题宽松', description: '更大的演算与步骤空间', settings: cloneSettings({ ...standardSettings, defaultAnswerLines: 8, questionGap: 7 }) },
-  { id: 'compact', name: '省纸双栏', description: 'A4 双栏，适合短题与选择题', settings: cloneSettings({ ...standardSettings, columns: 2, fontSize: 9.5, lineHeight: 1.55, defaultAnswerLines: 2, margins: { top: 10, right: 9, bottom: 9, left: 9 } }) },
-  { id: 'large-text', name: '大字护眼', description: '大字号、宽行距和答题区', settings: cloneSettings({ ...standardSettings, fontSize: 13, lineHeight: 1.9, defaultAnswerLines: 6 }) },
-  { id: 'a5-booklet', name: 'A5 小册', description: '适合便携练习册与活页纸', settings: cloneSettings({ ...standardSettings, paperId: 'A5', fontSize: 10.5, defaultAnswerLines: 3, margins: { top: 9, right: 9, bottom: 8, left: 9 } }) },
+  { id: 'calculation', name: '计算题宽松', description: '大行距单栏，题面阅读更舒展', settings: cloneSettings({ ...standardSettings, questionGap: 7 }) },
+  { id: 'compact', name: '省纸双栏', description: 'A4 双栏，适合短题与选择题', settings: cloneSettings({ ...standardSettings, columns: 2, fontSize: 9.5, lineHeight: 1.55, margins: { top: 10, right: 9, bottom: 9, left: 9 } }) },
+  { id: 'large-text', name: '大字护眼', description: '大字号与宽行距，阅读更轻松', settings: cloneSettings({ ...standardSettings, fontSize: 13, lineHeight: 1.9 }) },
+  { id: 'a5-booklet', name: 'A5 小册', description: '适合便携练习册与活页纸', settings: cloneSettings({ ...standardSettings, paperId: 'A5', fontSize: 10.5, margins: { top: 9, right: 9, bottom: 8, left: 9 } }) },
   { id: 'a4-cut-b5', name: 'A4 裁 B5', description: '右下裁切，左侧留 1cm 装订区', settings: cloneSettings({ ...standardSettings, a4B5Imposition: true, showCropMarks: true, bindingMargin: 10, showAnswerLines: false, margins: { top: 10, right: 10, bottom: 9, left: 10 } }) },
   { id: 'answer-sheet', name: '答案校对', description: '双栏紧凑展示已录答案', settings: cloneSettings({ ...standardSettings, columns: 2, fontSize: 9.5, lineHeight: 1.55, defaultAnswerLines: 0, showAnswers: true, showScoreFields: false }) },
 ]
@@ -182,10 +180,6 @@ function childParts(question: PrintableQuestion, parentId: string) {
   return question.parts.filter((part) => part.parent_id === parentId).sort((a, b) => a.position - b.position)
 }
 
-function answerParts(question: PrintableQuestion) {
-  return question.parts.filter((part) => part.part_type !== '题组说明').sort((a, b) => a.position - b.position)
-}
-
 function adjustmentFor(question: PrintableQuestion | string) {
   const id = typeof question === 'string' ? question : question.id
   if (!adjustments.value[id]) {
@@ -205,14 +199,6 @@ function questionAnswerLines(question: PrintableQuestion) {
 
 function partAnswerLines(question: PrintableQuestion, part: QuestionPart) {
   return clamp(adjustmentFor(question).partLines[part.id] ?? part.answer_lines ?? 3, 1, 16)
-}
-
-function changeQuestionLines(question: PrintableQuestion, amount: number) {
-  adjustmentFor(question).answerLines = clamp(questionAnswerLines(question) + amount, 0, 16)
-}
-
-function changePartLines(question: PrintableQuestion, part: QuestionPart, amount: number) {
-  adjustmentFor(question).partLines[part.id] = clamp(partAnswerLines(question, part) + amount, 1, 16)
 }
 
 function hasPartAnswer(part: QuestionPart) {
@@ -460,20 +446,6 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
                 <button type="button" title="下移" aria-label="下移题目" :disabled="selectedIds.indexOf(question.id) === selectedIds.length - 1" @click="moveQuestion(question.id, 1)"><ArrowDown :size="15" /></button>
                 <label class="break-toggle"><input v-model="adjustmentFor(question).pageBreakBefore" type="checkbox" />题前分页</label>
               </div>
-              <div v-if="!question.parts.length && !settings.showAnswers && settings.showAnswerLines" class="tool-row">
-                <span>答题行</span>
-                <button type="button" aria-label="减少答题行" @click="changeQuestionLines(question, -1)"><Minus :size="14" /></button>
-                <b>{{ questionAnswerLines(question) }}</b>
-                <button type="button" aria-label="增加答题行" @click="changeQuestionLines(question, 1)"><Plus :size="14" /></button>
-              </div>
-              <div v-if="question.parts.length && !settings.showAnswers && settings.showAnswerLines" class="part-space-list">
-                <div v-for="part in answerParts(question)" :key="part.id" class="tool-row">
-                  <span :title="part.prompt">{{ part.label || part.part_type }}</span>
-                  <button type="button" aria-label="减少小问答题行" @click="changePartLines(question, part, -1)"><Minus :size="14" /></button>
-                  <b>{{ partAnswerLines(question, part) }}</b>
-                  <button type="button" aria-label="增加小问答题行" @click="changePartLines(question, part, 1)"><Plus :size="14" /></button>
-                </div>
-              </div>
             </div>
           </article>
         </div>
@@ -526,7 +498,7 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
                       </div>
                       <div v-else-if="settings.showAnswers" class="printed-answer"><strong>答案</strong><span>{{ item.question.correct_answer || '暂未录入' }}</span><p v-if="item.question.explanation">{{ item.question.explanation }}</p></div>
                       <div v-else-if="settings.showAnswerLines" class="answer-lines"><span v-for="line in questionAnswerLines(item.question)" :key="line"></span></div>
-                      <p v-if="item.oversized" class="overflow-warning screen-only">本题超过单页高度，请减少答题行、字号或页边距。</p>
+                      <p v-if="item.oversized" class="overflow-warning screen-only">本题超过单页高度，请减少字号、题间距或页边距。</p>
                     </div>
                     </section>
                   </div>

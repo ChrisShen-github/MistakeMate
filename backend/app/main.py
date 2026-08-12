@@ -868,7 +868,11 @@ def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUp
         question.updated_at = datetime.now(timezone.utc)
         batch = session.get(UploadBatch, batch_id)
         if batch is not None:
-            batch.status = "confirmed" if payload.status == "confirmed" else "review_ready"
+            session.flush()
+            question_statuses = session.scalars(
+                select(MistakeQuestion.status).where(MistakeQuestion.batch_id == batch_id)
+            ).all()
+            batch.status = "confirmed" if question_statuses and all(value == "confirmed" for value in question_statuses) else "review_ready"
 
     with SessionLocal() as session:
         saved_question = session.get(MistakeQuestion, question_id)

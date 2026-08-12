@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { CheckCircle2, CircleAlert, FileText, Layers3, LoaderCircle, Plus, Save, Sparkles, Trash2 } from '@lucide/vue'
+import { ArrowLeft, CheckCircle2, CircleAlert, FileText, Layers3, LoaderCircle, Plus, Save, Sparkles, Trash2 } from '@lucide/vue'
 import QuestionPartEditor from './QuestionPartEditor.vue'
 import type { MistakeQuestion, QuestionPart } from '../types/questions'
 
 export type { MistakeQuestion } from '../types/questions'
 
 const props = defineProps<{ batchId: string; question: MistakeQuestion }>()
-const emit = defineEmits<{ saved: [question: MistakeQuestion] }>()
+const emit = defineEmits<{ saved: [question: MistakeQuestion]; finished: [] }>()
 
 function cloneQuestion(question: MistakeQuestion) {
   return {
@@ -25,6 +25,7 @@ function cloneQuestion(question: MistakeQuestion) {
 
 const draft = reactive(cloneQuestion(props.question))
 const isSaving = ref(false)
+const savingAction = ref<'draft' | 'confirmed' | null>(null)
 const isSuggesting = ref(false)
 const feedback = ref('')
 const saveError = ref('')
@@ -36,8 +37,6 @@ const circledLabels = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '
 
 watch(() => props.question, (question) => {
   Object.assign(draft, cloneQuestion(question))
-  feedback.value = ''
-  saveError.value = ''
 }, { deep: true })
 
 function newId() { return crypto.randomUUID() }
@@ -115,6 +114,7 @@ function returnToSimpleMode() {
 async function save(status: 'draft' | 'confirmed') {
   if (isSaving.value) return
   isSaving.value = true
+  savingAction.value = status
   feedback.value = ''
   saveError.value = ''
   try {
@@ -129,6 +129,7 @@ async function save(status: 'draft' | 'confirmed') {
     saveError.value = error instanceof Error ? error.message : '保存失败，请稍后重试。'
   } finally {
     isSaving.value = false
+    savingAction.value = null
   }
 }
 </script>
@@ -185,7 +186,16 @@ async function save(status: 'draft' | 'confirmed') {
       <label>整题知识点 <span>用逗号分隔</span><input v-model="draft.knowledge_points" maxlength="1000" placeholder="例如：数的表示，整式运算"></label>
     </div>
 
-    <footer class="editor-actions"><p><span aria-hidden="true">●</span>{{ question.status === 'confirmed' ? '已确认，可继续修改后重新确认。' : '保存草稿后可随时回来继续编辑。' }}</p><div><button class="draft-button" type="button" :disabled="isSaving" @click="save('draft')"><Save :size="17" />保存草稿</button><button class="confirm-button" type="button" :disabled="isSaving" @click="save('confirmed')"><LoaderCircle v-if="isSaving" class="spin" :size="17" /><CheckCircle2 v-else :size="17" />确认题目</button></div></footer>
+    <footer class="editor-actions">
+      <p v-if="saveError" class="action-message error" role="alert"><CircleAlert :size="17" />{{ saveError }}</p>
+      <p v-else-if="feedback" class="action-message success" role="status" aria-live="polite"><CheckCircle2 :size="17" />{{ feedback }}</p>
+      <p v-else><span aria-hidden="true">●</span>{{ question.status === 'confirmed' ? '已确认，可继续修改后重新确认。' : '保存草稿后可随时回来继续编辑。' }}</p>
+      <div>
+        <button v-if="question.status === 'confirmed' && feedback" class="back-library-button" type="button" @click="emit('finished')"><ArrowLeft :size="17" />返回我的错题</button>
+        <button class="draft-button" type="button" :disabled="isSaving" @click="save('draft')"><LoaderCircle v-if="savingAction === 'draft'" class="spin" :size="17" /><Save v-else :size="17" />{{ savingAction === 'draft' ? '正在保存…' : '保存草稿' }}</button>
+        <button class="confirm-button" type="button" :disabled="isSaving" @click="save('confirmed')"><LoaderCircle v-if="savingAction === 'confirmed'" class="spin" :size="17" /><CheckCircle2 v-else :size="17" />{{ savingAction === 'confirmed' ? '正在确认…' : question.status === 'confirmed' ? '重新确认' : '确认题目' }}</button>
+      </div>
+    </footer>
   </article>
 </template>
 
@@ -209,10 +219,10 @@ async function save(status: 'draft' | 'confirmed') {
 .text-action,.add-part-button,.add-group-button { color: #285fae; border: 1px solid #b9d1ef; }.suggest-button { color: #fff; border: 1px solid #2563eb; background: #2563eb !important; }.structure-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }.structure-actions button:disabled { cursor: wait; opacity: .65; }
 .option-list,.part-list { display: grid; gap: 11px; margin-top: 15px; }.option-row { display: grid; grid-template-columns: 40px 48px minmax(0,1fr) 44px; gap: 8px; align-items: center; }.option-row > label:first-child { color: #6f8398; font-size: 11px; font-weight: 700; }.option-row input { min-height: 44px; padding: 0 8px; text-align: center; }.option-row textarea { min-height: 44px; padding: 9px; resize: vertical; }.remove-option { display: grid; width: 44px; height: 44px; place-items: center; color: #9f4b40; border: 0; border-radius: 8px; background: #fff3f0; cursor: pointer; }.empty-options { margin: 13px 0 0; color: #71859a; font-size: 13px; }
 .simple-mode-button { justify-self: start; min-height: 44px; padding: 8px 12px; color: #8b534b; border: 1px solid #e5c2bc; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
-.simple-answer-details { margin-top: 23px; overflow: hidden; border: 1px solid #d8e5f2; border-radius: 10px; background: #f8fbff; }.simple-answer-details summary { display: flex; min-height: 46px; box-sizing: border-box; align-items: center; gap: 7px; padding: 12px 16px; color: #355875; font-size: 13px; font-weight: 700; cursor: pointer; }.simple-answer-details summary span { color: #71879c; font-size: 11px; font-weight: 500; }.simple-answer-details summary small { margin-left: auto; padding: 3px 6px; color: #247358; border-radius: 5px; background: #e8f7f0; }.simple-answer-details .answer-grid { margin: 0; padding: 2px 16px 16px; }.metadata-grid { margin-top: 23px; }.editor-actions { align-items: center; margin-top: 24px; padding-top: 17px; border-top: 1px solid #e0e7ee; }.editor-actions p { display: flex; align-items: flex-start; gap: 7px; margin: 0; color: #657b92; font-size: 12px; line-height: 1.5; }.editor-actions p span { color: #2f9a75; font-size: 14px; }.editor-actions > div { display: flex; gap: 9px; }.editor-actions button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 6px; padding: 9px 13px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }.draft-button { color: #315f9b; border: 1px solid #b9cee5; background: #fff; }.confirm-button { min-width: 122px; color: #fff; border: 1px solid #f97316; background: #f97316; }.editor-actions button:disabled { cursor: wait; opacity: .6; }
+.simple-answer-details { margin-top: 23px; overflow: hidden; border: 1px solid #d8e5f2; border-radius: 10px; background: #f8fbff; }.simple-answer-details summary { display: flex; min-height: 46px; box-sizing: border-box; align-items: center; gap: 7px; padding: 12px 16px; color: #355875; font-size: 13px; font-weight: 700; cursor: pointer; }.simple-answer-details summary span { color: #71879c; font-size: 11px; font-weight: 500; }.simple-answer-details summary small { margin-left: auto; padding: 3px 6px; color: #247358; border-radius: 5px; background: #e8f7f0; }.simple-answer-details .answer-grid { margin: 0; padding: 2px 16px 16px; }.metadata-grid { margin-top: 23px; }.editor-actions { align-items: center; margin-top: 24px; padding-top: 17px; border-top: 1px solid #e0e7ee; }.editor-actions p { display: flex; align-items: flex-start; gap: 7px; margin: 0; color: #657b92; font-size: 12px; line-height: 1.5; }.editor-actions p span { color: #2f9a75; font-size: 14px; }.editor-actions p.action-message { max-width: 560px; padding: 9px 11px; border-radius: 8px; font-weight: 700; }.editor-actions p.action-message svg { flex: 0 0 auto; }.editor-actions p.action-message.success { color: #247358; background: #e8f7f0; }.editor-actions p.action-message.error { color: #a7483b; background: #fff0ed; }.editor-actions > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }.editor-actions button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 6px; padding: 9px 13px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }.back-library-button,.draft-button { color: #315f9b; border: 1px solid #b9cee5; background: #fff; }.confirm-button { min-width: 122px; color: #fff; border: 1px solid #f97316; background: #f97316; }.editor-actions button:disabled { cursor: wait; opacity: .6; }
 .spin { animation: rotate .8s linear infinite; }@keyframes rotate { to { transform: rotate(360deg); } }.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 @media (max-width: 760px) {
-  .question-editor { margin-top: 18px; padding: 17px; }.editor-heading,.structure-heading,.editor-actions { align-items: stretch; flex-direction: column; }.draft-chip { align-self: flex-start; }.editor-grid { grid-template-columns: 1fr; gap: 14px; }.wide-field { grid-column: auto; }.options-section,.structure-section { padding: 15px; }.structure-actions { display: grid; grid-template-columns: 1fr 1fr; }.suggest-button { grid-column: 1 / -1; }.option-row { grid-template-columns: 43px minmax(0,1fr) 44px; }.option-row > label:first-child { display: none; }.option-row textarea { grid-column: 1 / -1; grid-row: 2; }.option-row input { grid-column: 1; grid-row: 1; }.remove-option { grid-column: 3; grid-row: 1; }.editor-actions > div { display: grid; grid-template-columns: 1fr 1.2fr; }.editor-actions button { width: 100%; }
+  .question-editor { margin-top: 18px; padding: 17px; }.editor-heading,.structure-heading,.editor-actions { align-items: stretch; flex-direction: column; }.draft-chip { align-self: flex-start; }.editor-grid { grid-template-columns: 1fr; gap: 14px; }.wide-field { grid-column: auto; }.options-section,.structure-section { padding: 15px; }.structure-actions { display: grid; grid-template-columns: 1fr 1fr; }.suggest-button { grid-column: 1 / -1; }.option-row { grid-template-columns: 43px minmax(0,1fr) 44px; }.option-row > label:first-child { display: none; }.option-row textarea { grid-column: 1 / -1; grid-row: 2; }.option-row input { grid-column: 1; grid-row: 1; }.remove-option { grid-column: 3; grid-row: 1; }.editor-actions > div { display: grid; grid-template-columns: 1fr 1fr; }.back-library-button { grid-column: 1 / -1; }.editor-actions button { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) { .stars button { transition: none; }.spin { animation: none; } }
 </style>

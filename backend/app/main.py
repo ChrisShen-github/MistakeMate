@@ -131,6 +131,20 @@ class QuestionPart(Base):
     question: Mapped[MistakeQuestion] = relationship(back_populates="parts")
 
 
+class PrintTemplate(Base):
+    __tablename__ = "print_templates"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    settings: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 class UploadResponse(BaseModel):
     id: str
     status: str
@@ -233,6 +247,17 @@ class PrintableQuestionResponse(MistakeQuestionResponse):
     subject: str
     source: str
     batch_created_at: datetime
+
+
+class PrintTemplatePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    settings: dict[str, Any]
+
+
+class PrintTemplateResponse(PrintTemplatePayload):
+    id: str
+    created_at: datetime
+    updated_at: datetime
 
 
 ocr_model: Any | None = None
@@ -746,7 +771,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:4173", "http://127.0.0.1:4173", "http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -806,6 +831,69 @@ def list_printable_questions(subject: str | None = None) -> list[PrintableQuesti
             )
             for question, batch in rows
         ]
+
+
+def to_print_template_response(template: PrintTemplate) -> PrintTemplateResponse:
+    try:
+        settings = json.loads(template.settings)
+    except (json.JSONDecodeError, TypeError):
+        settings = {}
+    return PrintTemplateResponse(
+        id=template.id,
+        name=template.name,
+        settings=settings if isinstance(settings, dict) else {},
+        created_at=template.created_at,
+        updated_at=template.updated_at,
+    )
+
+
+def normalize_print_template(payload: PrintTemplatePayload) -> tuple[str, str]:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="模板名称不能为空。")
+    settings = json.dumps(payload.settings, ensure_ascii=False)
+    if len(settings.encode("utf-8")) > 32 * 1024:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="模板设置内容过大。")
+    return name, settings
+
+
+@app.get("/api/print/templates", response_model=list[PrintTemplateResponse])
+def list_print_templates() -> list[PrintTemplateResponse]:
+    with SessionLocal() as session:
+        templates = session.execute(select(PrintTemplate).order_by(PrintTemplate.updated_at.desc())).scalars().all()
+        return [to_print_template_response(template) for template in templates]
+
+
+@app.post("/api/print/templates", response_model=PrintTemplateResponse, status_code=status.HTTP_201_CREATED)
+def create_print_template(payload: PrintTemplatePayload) -> PrintTemplateResponse:
+    name, settings = normalize_print_template(payload)
+    with SessionLocal.begin() as session:
+        template = PrintTemplate(id=str(uuid4()), name=name, settings=settings)
+        session.add(template)
+    return to_print_template_response(template)
+
+
+@app.put("/api/print/templates/{template_id}", response_model=PrintTemplateResponse)
+def update_print_template(template_id: str, payload: PrintTemplatePayload) -> PrintTemplateResponse:
+    name, settings = normalize_print_template(payload)
+    with SessionLocal.begin() as session:
+        template = session.get(PrintTemplate, template_id)
+        if template is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这个打印模板。")
+        template.name = name
+        template.settings = settings
+        template.updated_at = datetime.now(timezone.utc)
+    return to_print_template_response(template)
+
+
+@app.delete("/api/print/templates/{template_id}")
+def delete_print_template(template_id: str) -> dict[str, str]:
+    with SessionLocal.begin() as session:
+        template = session.get(PrintTemplate, template_id)
+        if template is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这个打印模板。")
+        session.delete(template)
+    return {"status": "deleted"}
 
 
 @app.get("/api/mistakes/{batch_id}", response_model=MistakeBatchDetailResponse)

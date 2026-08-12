@@ -4,11 +4,12 @@ import os
 import shutil
 import json
 import math
+import re
 import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -51,6 +52,7 @@ class UploadBatch(Base):
     status: Mapped[str] = mapped_column(String(32), default="queued")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     files: Mapped[list["UploadedFile"]] = relationship(back_populates="batch", cascade="all, delete-orphan")
+    questions: Mapped[list["MistakeQuestion"]] = relationship(back_populates="batch", cascade="all, delete-orphan")
 
 
 class UploadedFile(Base):
@@ -88,6 +90,26 @@ class OcrRegion(Base):
     height: Mapped[float] = mapped_column(Float)
 
 
+class MistakeQuestion(Base):
+    __tablename__ = "mistake_questions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("upload_batches.id"), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=1)
+    question_type: Mapped[str] = mapped_column(String(32), default="单选题")
+    stem: Mapped[str] = mapped_column(Text, default="")
+    options: Mapped[str] = mapped_column(Text, default="[]")
+    correct_answer: Mapped[str] = mapped_column(String(128), default="")
+    explanation: Mapped[str] = mapped_column(Text, default="")
+    knowledge_points: Mapped[str] = mapped_column(Text, default="")
+    difficulty: Mapped[int] = mapped_column(Integer, default=3)
+    error_type: Mapped[str] = mapped_column(String(32), default="")
+    status: Mapped[str] = mapped_column(String(32), default="draft")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    batch: Mapped[UploadBatch] = relationship(back_populates="questions")
+
+
 class UploadResponse(BaseModel):
     id: str
     status: str
@@ -120,13 +142,47 @@ class OcrRunResponse(BaseModel):
     completed_at: datetime | None
 
 
+class QuestionOption(BaseModel):
+    label: str
+    text: str
+
+
+class MistakeQuestionResponse(BaseModel):
+    id: str
+    position: int
+    question_type: str
+    stem: str
+    options: list[QuestionOption]
+    correct_answer: str
+    explanation: str
+    knowledge_points: str
+    difficulty: int
+    error_type: str
+    status: str
+    updated_at: datetime
+
+
+class QuestionUpdateRequest(BaseModel):
+    question_type: str
+    stem: str
+    options: list[QuestionOption]
+    correct_answer: str = ""
+    explanation: str = ""
+    knowledge_points: str = ""
+    difficulty: int = 3
+    error_type: str = ""
+    status: str = "draft"
+
+
 class MistakeBatchDetailResponse(MistakeBatchResponse):
     files: list[UploadedFileResponse]
     ocr: OcrRunResponse | None
+    questions: list[MistakeQuestionResponse]
 
 
 ocr_model: Any | None = None
 ocr_model_lock = Lock()
+OPTION_LABEL_PATTERN = re.compile(r"^([A-H])(?:[.、．:：]\s*|\s+|$)(.*)$")
 
 
 def to_ocr_response(run: OcrRun | None) -> OcrRunResponse | None:
@@ -140,6 +196,115 @@ def to_ocr_response(run: OcrRun | None) -> OcrRunResponse | None:
         started_at=run.started_at,
         completed_at=run.completed_at,
     )
+
+
+def to_question_response(question: MistakeQuestion) -> MistakeQuestionResponse:
+    try:
+        parsed_options = json.loads(question.options)
+    except json.JSONDecodeError:
+        parsed_options = []
+    options = [QuestionOption(label=str(item.get("label", "")), text=str(item.get("text", ""))) for item in parsed_options if isinstance(item, dict)]
+    return MistakeQuestionResponse(
+        id=question.id,
+        position=question.position,
+        question_type=question.question_type,
+        stem=question.stem,
+        options=options,
+        correct_answer=question.correct_answer,
+        explanation=question.explanation,
+        knowledge_points=question.knowledge_points,
+        difficulty=question.difficulty,
+        error_type=question.error_type,
+        status=question.status,
+        updated_at=question.updated_at,
+    )
+
+
+def first_non_empty(lines: list[str], start: int, limit: int = 8) -> str:
+    for line in lines[start : start + limit]:
+        match = OPTION_LABEL_PATTERN.match(line)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def build_question_draft(ocr_text: str) -> MistakeQuestion:
+    lines = [line.strip() for line in ocr_text.splitlines() if line.strip()]
+    question_start = next((index for index, line in enumerate(lines) if re.search(r"[（(](?:单选|多选|判断)", line)), 0)
+    marker_line = lines[question_start] if lines else ""
+    type_match = re.search(r"[（(](单选题|多选题|判断题)[）)]", marker_line)
+    question_type = type_match.group(1) if type_match else "其他"
+    stem_opening = re.sub(r"^.*?[（(](?:单选题|多选题|判断题)[）)]\s*", "", marker_line)
+    option_indexes = [index for index, line in enumerate(lines) if OPTION_LABEL_PATTERN.match(line)]
+    first_option_index = next((index for index in option_indexes if index >= question_start), len(lines))
+    stem_lines = ([stem_opening] if stem_opening else []) + lines[question_start + 1 : first_option_index]
+    stem = "\n".join(line for line in stem_lines if line)
+
+    stop_markers = ("正确答案", "你的答案", "全站正确率", "文本解析", "解析", "纠错", "收藏", "笔记", "草稿纸", "答题卡")
+    answer_marker_index = next((index for index, line in enumerate(lines) if "正确答案" in line), -1)
+    option_indexes = [index for index in option_indexes if index < answer_marker_index or answer_marker_index < 0]
+    options: list[dict[str, str]] = []
+    for position, option_index in enumerate(option_indexes):
+        if option_index < first_option_index:
+            continue
+        label_match = OPTION_LABEL_PATTERN.match(lines[option_index])
+        if label_match is None:
+            continue
+        label, first_text = label_match.groups()
+        next_index = option_indexes[position + 1] if position + 1 < len(option_indexes) else len(lines)
+        option_lines = [first_text] if first_text else []
+        for line in lines[option_index + 1 : next_index]:
+            if any(marker in line for marker in stop_markers):
+                break
+            option_lines.append(line)
+        text = "\n".join(line for line in option_lines if line).strip()
+        if text:
+            options.append({"label": label, "text": text})
+
+    correct_answer = first_non_empty(lines, answer_marker_index + 1) if answer_marker_index >= 0 else ""
+    explanation_marker_index = next((index for index, line in enumerate(lines) if "文本解析" in line or line == "解析"), -1)
+    explanation_lines: list[str] = []
+    if explanation_marker_index >= 0:
+        for line in lines[explanation_marker_index + 1 :]:
+            if line in {"纠错", "收藏", "笔记", "草稿纸", "答题卡", "答案"}:
+                continue
+            explanation_lines.append(line)
+
+    return MistakeQuestion(
+        id=str(uuid4()),
+        position=1,
+        question_type=question_type,
+        stem=stem or "请根据原图补充题干。",
+        options=json.dumps(options, ensure_ascii=False),
+        correct_answer=correct_answer,
+        explanation="\n".join(explanation_lines),
+        knowledge_points="",
+        difficulty=3,
+        error_type="",
+        status="draft",
+    )
+
+
+def create_question_draft_if_missing(session: Any, batch_id: str, ocr_text: str) -> None:
+    existing = session.execute(select(MistakeQuestion).where(MistakeQuestion.batch_id == batch_id).limit(1)).scalar_one_or_none()
+    if existing is None and ocr_text.strip():
+        question = build_question_draft(ocr_text)
+        question.batch_id = batch_id
+        session.add(question)
+    elif (
+        existing is not None
+        and existing.status == "draft"
+        and not existing.knowledge_points
+        and not existing.error_type
+        and existing.updated_at <= existing.created_at + timedelta(seconds=2)
+    ):
+        refreshed = build_question_draft(ocr_text)
+        existing.question_type = refreshed.question_type
+        existing.stem = refreshed.stem
+        existing.options = refreshed.options
+        existing.correct_answer = refreshed.correct_answer
+        existing.explanation = refreshed.explanation
+        existing.updated_at = datetime.now(timezone.utc)
 
 
 def get_ocr_model() -> Any:
@@ -293,6 +458,7 @@ def run_ocr(batch_id: str) -> None:
             run.text = "\n".join(text_lines)
             run.raw_result = json.dumps(results, ensure_ascii=False)
             run.completed_at = datetime.now(timezone.utc)
+            create_question_draft_if_missing(session, batch_id, run.text)
     except Exception as error:
         with SessionLocal.begin() as session:
             batch = session.get(UploadBatch, batch_id)
@@ -316,6 +482,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             if attempt == 29:
                 raise
             time.sleep(1)
+    with SessionLocal.begin() as session:
+        completed_runs = session.execute(select(OcrRun).where(OcrRun.status == "completed")).scalars().all()
+        for run in completed_runs:
+            create_question_draft_if_missing(session, run.batch_id, run.text)
     yield
     engine.dispose()
 
@@ -325,7 +495,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:4173", "http://127.0.0.1:4173", "http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT"],
     allow_headers=["*"],
 )
 
@@ -370,6 +540,7 @@ def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这组错题。")
         files = list(batch.files)
         ocr = to_ocr_response(session.get(OcrRun, batch_id))
+        questions = sorted(list(batch.questions), key=lambda question: question.position)
 
     return MistakeBatchDetailResponse(
         id=batch.id,
@@ -389,6 +560,7 @@ def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
             for file in files
         ],
         ocr=ocr,
+        questions=[to_question_response(question) for question in questions],
     )
 
 
@@ -425,6 +597,48 @@ def request_ocr(batch_id: str, background_tasks: BackgroundTasks) -> OcrRunRespo
 
     background_tasks.add_task(run_ocr, batch_id)
     return to_ocr_response(run)
+
+
+@app.put("/api/mistakes/{batch_id}/questions/{question_id}", response_model=MistakeQuestionResponse)
+def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUpdateRequest) -> MistakeQuestionResponse:
+    if payload.question_type not in {"单选题", "多选题", "判断题", "填空题", "计算题", "简答题", "其他"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="题型不正确。")
+    if payload.status not in {"draft", "confirmed"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="确认状态不正确。")
+    if not payload.stem.strip():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请补充题干后再保存。")
+    if not 1 <= payload.difficulty <= 5:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="难度应在 1 到 5 星之间。")
+    if len(payload.options) > 8:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="选项不能超过 8 个。")
+
+    normalized_options: list[dict[str, str]] = []
+    for option in payload.options:
+        label = option.label.strip()[:8]
+        text = option.text.strip()[:4000]
+        if not label or not text:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="每个选项都需要编号和内容。")
+        normalized_options.append({"label": label, "text": text})
+
+    with SessionLocal.begin() as session:
+        question = session.get(MistakeQuestion, question_id)
+        if question is None or question.batch_id != batch_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+        question.question_type = payload.question_type
+        question.stem = payload.stem.strip()[:12000]
+        question.options = json.dumps(normalized_options, ensure_ascii=False)
+        question.correct_answer = payload.correct_answer.strip()[:128]
+        question.explanation = payload.explanation.strip()[:12000]
+        question.knowledge_points = payload.knowledge_points.strip()[:1000]
+        question.difficulty = payload.difficulty
+        question.error_type = payload.error_type.strip()[:32]
+        question.status = payload.status
+        question.updated_at = datetime.now(timezone.utc)
+        batch = session.get(UploadBatch, batch_id)
+        if batch is not None:
+            batch.status = "confirmed" if payload.status == "confirmed" else "review_ready"
+
+    return to_question_response(question)
 
 
 @app.post("/api/uploads", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)

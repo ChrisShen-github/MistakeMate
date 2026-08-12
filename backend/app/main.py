@@ -37,8 +37,6 @@ ALLOWED_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/he
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".pdf"}
 SESSION_COOKIE = "mistakemate_session"
 SESSION_DAYS = 30
-auth_secret = os.getenv("AUTH_SECRET", "mistakemate-change-this-secret")
-ai_config_secret = os.getenv("AI_CONFIG_SECRET", auth_secret)
 
 storage_root = Path(os.getenv("STORAGE_ROOT", "storage")).resolve()
 database_url = os.getenv("DATABASE_URL", "sqlite:///storage/mistakemate.db")
@@ -51,6 +49,15 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 class Base(DeclarativeBase):
     pass
+
+
+class AppSecurity(Base):
+    __tablename__ = "app_security"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    auth_secret: Mapped[str] = mapped_column(String(128))
+    ai_config_secret: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class AppUser(Base):
@@ -232,6 +239,20 @@ class UserResponse(BaseModel):
     display_name: str
 
 
+class ProfileUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=64)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordChangeResponse(BaseModel):
+    status: str
+    message: str
+
+
 class AuthBootstrapResponse(BaseModel):
     has_users: bool
 
@@ -380,6 +401,25 @@ def to_user_response(user: AppUser) -> UserResponse:
     return UserResponse(id=user.id, username=user.username, display_name=user.display_name)
 
 
+def ensure_security_row(session: Any) -> AppSecurity:
+    security = session.get(AppSecurity, 1)
+    if security is None:
+        security = AppSecurity(
+            id=1,
+            auth_secret=secrets.token_urlsafe(48),
+            ai_config_secret=secrets.token_urlsafe(48),
+        )
+        session.add(security)
+        session.flush()
+    return security
+
+
+def get_security_secret(field_name: str) -> str:
+    with SessionLocal.begin() as session:
+        security = ensure_security_row(session)
+        return str(getattr(security, field_name))
+
+
 def normalize_username(value: str) -> str:
     username = value.strip().lower()
     if not re.fullmatch(r"[a-z0-9_.-]{3,64}", username):
@@ -412,14 +452,14 @@ def verify_password(password: str, stored_hash: str) -> bool:
 def create_session_token(user_id: str) -> str:
     expires_at = int(time.time()) + SESSION_DAYS * 24 * 60 * 60
     payload = base64.urlsafe_b64encode(f"{user_id}:{expires_at}".encode()).decode().rstrip("=")
-    signature = hmac.new(auth_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    signature = hmac.new(get_security_secret("auth_secret").encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}.{signature}"
 
 
 def parse_session_token(token: str) -> str | None:
     try:
         payload, signature = token.split(".", 1)
-        expected = hmac.new(auth_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        expected = hmac.new(get_security_secret("auth_secret").encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature, expected):
             return None
         decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode()
@@ -462,7 +502,7 @@ def get_owned_batch(session: Any, batch_id: str, user_id: str) -> UploadBatch:
 
 
 def get_fernet() -> Fernet:
-    key = base64.urlsafe_b64encode(hashlib.sha256(ai_config_secret.encode()).digest())
+    key = base64.urlsafe_b64encode(hashlib.sha256(get_security_secret("ai_config_secret").encode()).digest())
     return Fernet(key)
 
 
@@ -1103,6 +1143,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
                 raise
             time.sleep(1)
     with SessionLocal.begin() as session:
+        ensure_security_row(session)
         completed_runs = session.execute(select(OcrRun).where(OcrRun.status == "completed")).scalars().all()
         for run in completed_runs:
             create_question_draft_if_missing(session, run.batch_id, run.text)
@@ -1170,6 +1211,34 @@ def logout_user(response: Response) -> dict[str, str]:
 @app.get("/api/auth/me", response_model=UserResponse)
 def current_user(user: AppUser = Depends(require_user)) -> UserResponse:
     return to_user_response(user)
+
+
+@app.put("/api/auth/profile", response_model=UserResponse)
+def update_profile(payload: ProfileUpdateRequest, user: AppUser = Depends(require_user)) -> UserResponse:
+    display_name = payload.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="显示名称不能为空。")
+    with SessionLocal.begin() as session:
+        saved_user = session.get(AppUser, user.id)
+        if saved_user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效，请重新登录。")
+        saved_user.display_name = display_name
+    user.display_name = display_name
+    return to_user_response(user)
+
+
+@app.put("/api/auth/password", response_model=PasswordChangeResponse)
+def change_password(payload: PasswordChangeRequest, user: AppUser = Depends(require_user)) -> PasswordChangeResponse:
+    if payload.current_password == payload.new_password:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="新密码不能与当前密码相同。")
+    with SessionLocal.begin() as session:
+        saved_user = session.get(AppUser, user.id)
+        if saved_user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效，请重新登录。")
+        if not verify_password(payload.current_password, saved_user.password_hash):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前密码不正确。")
+        saved_user.password_hash = hash_password(payload.new_password)
+    return PasswordChangeResponse(status="ok", message="密码已修改，下次登录请使用新密码。")
 
 
 @app.get("/api/settings/ai", response_model=AiConfigResponse)

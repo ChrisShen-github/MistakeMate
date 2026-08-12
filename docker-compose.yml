@@ -8,8 +8,6 @@ services:
       DATABASE_URL: postgresql+psycopg://mistakemate:${POSTGRES_PASSWORD:-mistakemate_local_only}@postgresql:5432/mistakemate
       STORAGE_ROOT: /app/storage
       PADDLE_PDX_MODEL_SOURCE: BOS
-      AUTH_SECRET: ${AUTH_SECRET:-mistakemate-local-auth-change-me}
-      AI_CONFIG_SECRET: ${AI_CONFIG_SECRET:-mistakemate-local-ai-change-me}
     volumes:
       - ./storage:/app/storage
       - ./models:/root/.paddlex

@@ -143,6 +143,11 @@ function onAuthenticated(user: SignedInUser) {
   currentView.value = 'dashboard'
 }
 
+function onProfileUpdated(user: SignedInUser) {
+  currentUser.value = user
+  showNotice('账户资料已更新。')
+}
+
 function openSettings() {
   if (currentView.value !== 'settings') settingsReturnView.value = currentView.value
   currentView.value = 'settings'
@@ -226,7 +231,7 @@ onMounted(async () => {
       <MistakeLibrary v-else-if="currentView === 'library'" @upload="openUpload" @print="openPrint" @open="openBatch($event.id)" />
       <BatchReview v-else-if="currentView === 'review'" :batch-id="activeBatchId" @back="openLibrary" @configure-ai="openSettings" />
       <PrintWorkspace v-else-if="currentView === 'print'" @back="closePrint" />
-      <SettingsWorkspace v-else-if="currentView === 'settings'" :user="currentUser" @back="closeSettings" @logout="logout" />
+      <SettingsWorkspace v-else-if="currentView === 'settings'" :user="currentUser" @back="closeSettings" @logout="logout" @profile-updated="onProfileUpdated" />
 
       <section v-else class="dashboard">
         <div class="welcome-row">

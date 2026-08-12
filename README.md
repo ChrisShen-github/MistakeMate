@@ -18,7 +18,7 @@ docker compose up -d --build
 
 打开 `http://localhost:8080`。
 
-首次打开会创建 MistakeMate 账号。登录后可在右上角“账户与 AI 设置”中填写 OpenAI 兼容接口地址、视觉模型和 API 密钥。密钥会在服务端加密保存，不会回显到网页；生产部署时请把 `.env` 中的 `AUTH_SECRET` 和 `AI_CONFIG_SECRET` 换成随机长字符串。
+首次打开会创建 MistakeMate 账号。登录后可在右上角“账户与 AI 设置”中填写 OpenAI 兼容接口地址、视觉模型和 API 密钥。密钥会在服务端加密保存，不会回显到网页；认证签名和密钥加密所需的内部密钥会在首次启动时自动生成并保存在 PostgreSQL，不需要额外填写环境变量。
 
 ## 本地 OCR
 

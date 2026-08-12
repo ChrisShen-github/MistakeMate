@@ -9,13 +9,14 @@ import shutil
 import json
 import math
 import re
+import tarfile
 import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Any
 from uuid import uuid4
 from urllib.error import HTTPError, URLError
@@ -37,8 +38,18 @@ ALLOWED_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/he
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".pdf"}
 SESSION_COOKIE = "mistakemate_session"
 SESSION_DAYS = 30
+OCR_MODEL_BASE_URL = "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0"
+OCR_MODEL_PACKAGES = (
+    ("PP-LCNet_x1_0_doc_ori", "文档方向校正"),
+    ("UVDoc", "文档去扭曲"),
+    ("PP-LCNet_x1_0_textline_ori", "文本行方向识别"),
+    ("PP-OCRv6_medium_det", "文本检测"),
+    ("PP-OCRv6_medium_rec", "中文文本识别"),
+)
 
 storage_root = Path(os.getenv("STORAGE_ROOT", "storage")).resolve()
+ocr_model_root = Path(os.getenv("PADDLE_MODEL_HOME", str(Path.home() / ".paddlex"))).resolve()
+ocr_official_models_root = ocr_model_root / "official_models"
 database_url = os.getenv("DATABASE_URL", "sqlite:///storage/mistakemate.db")
 engine_options: dict[str, object] = {"pool_pre_ping": True}
 if database_url.startswith("sqlite"):
@@ -296,6 +307,27 @@ class AiModelListResponse(BaseModel):
     models: list[str]
 
 
+class OcrModelItemResponse(BaseModel):
+    id: str
+    name: str
+    installed: bool
+    size_bytes: int
+
+
+class OcrModelStatusResponse(BaseModel):
+    status: str
+    message: str
+    source: str
+    current_model: str
+    current_model_name: str
+    completed_models: int
+    total_models: int
+    downloaded_bytes: int
+    total_bytes: int | None
+    speed_bytes_per_second: float
+    models: list[OcrModelItemResponse]
+
+
 class QuestionOption(BaseModel):
     label: str
     text: str
@@ -381,6 +413,18 @@ class PrintTemplateResponse(PrintTemplatePayload):
 
 ocr_model: Any | None = None
 ocr_model_lock = Lock()
+ocr_model_download_lock = Lock()
+ocr_model_download_cancel = Event()
+ocr_model_download_state: dict[str, Any] = {
+    "status": "not_installed",
+    "message": "本地 OCR 模型尚未下载。",
+    "current_model": "",
+    "current_model_name": "",
+    "completed_models": 0,
+    "downloaded_bytes": 0,
+    "total_bytes": None,
+    "speed_bytes_per_second": 0.0,
+}
 OPTION_LABEL_PATTERN = re.compile(r"^([A-H])(?:[.、．:：]\s*|\s+|$)(.*)$")
 TOP_PART_PATTERN = re.compile(r"(?m)^\s*[（(](\d{1,2})[）)]\s*")
 CIRCLED_PART_PATTERN = re.compile(r"(?m)^\s*([①②③④⑤⑥⑦⑧⑨⑩])\s*")
@@ -863,7 +907,160 @@ def create_question_draft_if_missing(session: Any, batch_id: str, ocr_text: str,
         existing.updated_at = datetime.now(timezone.utc)
 
 
+def ocr_model_directory(model_id: str) -> Path:
+    return ocr_official_models_root / model_id
+
+
+def is_ocr_model_installed(model_id: str) -> bool:
+    model_dir = ocr_model_directory(model_id)
+    return model_dir.is_dir() and (model_dir / "inference.yml").is_file()
+
+
+def directory_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def ocr_models_ready() -> bool:
+    return all(is_ocr_model_installed(model_id) for model_id, _ in OCR_MODEL_PACKAGES)
+
+
+def update_ocr_download_state(**values: Any) -> None:
+    with ocr_model_download_lock:
+        ocr_model_download_state.update(values)
+
+
+def get_ocr_model_status() -> OcrModelStatusResponse:
+    models = [
+        OcrModelItemResponse(
+            id=model_id,
+            name=model_name,
+            installed=is_ocr_model_installed(model_id),
+            size_bytes=directory_size(ocr_model_directory(model_id)),
+        )
+        for model_id, model_name in OCR_MODEL_PACKAGES
+    ]
+    with ocr_model_download_lock:
+        state = dict(ocr_model_download_state)
+    completed_models = sum(model.installed for model in models)
+    if completed_models == len(models):
+        status = "ready"
+        message = "本地 OCR 模型已就绪。"
+    else:
+        status = state["status"]
+        message = state["message"]
+        if status == "ready":
+            status = "not_installed"
+    return OcrModelStatusResponse(
+        status=status,
+        message=message,
+        source="百度 BOS（官方国内源）",
+        current_model=state["current_model"],
+        current_model_name=state["current_model_name"],
+        completed_models=completed_models,
+        total_models=len(models),
+        downloaded_bytes=int(state["downloaded_bytes"]),
+        total_bytes=state["total_bytes"],
+        speed_bytes_per_second=float(state["speed_bytes_per_second"]),
+        models=models,
+    )
+
+
+def safe_extract_model_archive(archive_path: Path, model_id: str) -> None:
+    staging_root = ocr_model_root / ".mistakemate-model-download" / f"{model_id}-{uuid4().hex}"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(archive_path, "r:*") as archive:
+            for member in archive.getmembers():
+                member_path = Path(member.name)
+                if member_path.is_absolute() or ".." in member_path.parts or member.issym() or member.islnk():
+                    raise RuntimeError("模型压缩包包含不安全的文件路径。")
+            archive.extractall(staging_root)
+        entries = [entry for entry in staging_root.iterdir()]
+        source = entries[0] if len(entries) == 1 and entries[0].is_dir() else staging_root
+        if not (source / "inference.yml").is_file():
+            raise RuntimeError("模型文件不完整，未找到 inference.yml。")
+        target = ocr_model_directory(model_id)
+        if target.exists():
+            shutil.rmtree(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def download_ocr_model_archive(model_id: str, model_name: str, completed_models: int) -> None:
+    download_root = ocr_model_root / ".mistakemate-model-download"
+    download_root.mkdir(parents=True, exist_ok=True)
+    archive_path = download_root / f"{model_id}.tar.part"
+    url = f"{OCR_MODEL_BASE_URL}/{model_id}_infer.tar"
+    existing_size = archive_path.stat().st_size if archive_path.exists() else 0
+    request = UrlRequest(url, headers={"Range": f"bytes={existing_size}-"} if existing_size else {})
+    started_at = time.monotonic()
+    try:
+        with urlopen(request, timeout=30) as response:
+            content_length = response.headers.get("Content-Length")
+            resumed = getattr(response, "status", response.getcode()) == 206 and existing_size > 0
+            if not resumed:
+                existing_size = 0
+            total_bytes = existing_size + int(content_length) if content_length and content_length.isdigit() else None
+            update_ocr_download_state(
+                status="downloading",
+                message=f"正在下载：{model_name}",
+                current_model=model_id,
+                current_model_name=model_name,
+                completed_models=completed_models,
+                downloaded_bytes=existing_size,
+                total_bytes=total_bytes,
+                speed_bytes_per_second=0.0,
+            )
+            with archive_path.open("ab" if resumed else "wb") as output:
+                downloaded_bytes = existing_size
+                while chunk := response.read(256 * 1024):
+                    if ocr_model_download_cancel.is_set():
+                        raise InterruptedError("已取消下载。下次下载会从当前进度继续。")
+                    output.write(chunk)
+                    downloaded_bytes += len(chunk)
+                    elapsed = max(time.monotonic() - started_at, 0.1)
+                    update_ocr_download_state(
+                        downloaded_bytes=downloaded_bytes,
+                        total_bytes=total_bytes,
+                        speed_bytes_per_second=max(0.0, (downloaded_bytes - existing_size) / elapsed),
+                    )
+    except HTTPError as error:
+        raise RuntimeError(f"下载 {model_name} 失败（{error.code}）。请检查网络后重试。") from error
+    except URLError as error:
+        raise RuntimeError(f"无法连接官方模型源：{error.reason}") from error
+    update_ocr_download_state(status="extracting", message=f"正在校验并安装：{model_name}", speed_bytes_per_second=0.0)
+    safe_extract_model_archive(archive_path, model_id)
+    archive_path.unlink(missing_ok=True)
+
+
+def download_ocr_models() -> None:
+    global ocr_model
+    try:
+        ocr_model_download_cancel.clear()
+        for index, (model_id, model_name) in enumerate(OCR_MODEL_PACKAGES):
+            if ocr_model_download_cancel.is_set():
+                raise InterruptedError("已取消下载。下次下载会从当前进度继续。")
+            if is_ocr_model_installed(model_id):
+                continue
+            download_ocr_model_archive(model_id, model_name, index)
+        ocr_model = None
+        update_ocr_download_state(
+            status="ready", message="本地 OCR 模型已下载完成，可以开始识别。", current_model="", current_model_name="",
+            completed_models=len(OCR_MODEL_PACKAGES), downloaded_bytes=0, total_bytes=None, speed_bytes_per_second=0.0,
+        )
+    except InterruptedError as error:
+        update_ocr_download_state(status="cancelled", message=str(error), speed_bytes_per_second=0.0)
+    except Exception as error:
+        update_ocr_download_state(status="failed", message=str(error)[:500], speed_bytes_per_second=0.0)
+
+
 def get_ocr_model() -> Any:
+    if not ocr_models_ready():
+        raise RuntimeError("本地 OCR 模型尚未下载，请先在“OCR 模型”页面完成下载。")
     global ocr_model
     with ocr_model_lock:
         if ocr_model is None:
@@ -1349,6 +1546,39 @@ def test_ai_connection(user: AppUser = Depends(require_user)) -> AiConnectionRes
     return AiConnectionResponse(status="ok", message=result[:100])
 
 
+@app.get("/api/settings/ocr-models", response_model=OcrModelStatusResponse)
+def get_ocr_models_status(user: AppUser = Depends(require_user)) -> OcrModelStatusResponse:
+    return get_ocr_model_status()
+
+
+@app.post("/api/settings/ocr-models/download", response_model=OcrModelStatusResponse, status_code=status.HTTP_202_ACCEPTED)
+def start_ocr_models_download(user: AppUser = Depends(require_user)) -> OcrModelStatusResponse:
+    already_ready = False
+    with ocr_model_download_lock:
+        if ocr_model_download_state["status"] in {"downloading", "extracting"}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="OCR 模型正在下载，请稍候。")
+        if ocr_models_ready():
+            already_ready = True
+        else:
+            ocr_model_download_state.update(
+                status="downloading", message="正在准备下载本地 OCR 模型。", current_model="", current_model_name="",
+                completed_models=0, downloaded_bytes=0, total_bytes=None, speed_bytes_per_second=0.0,
+            )
+    if not already_ready:
+        Thread(target=download_ocr_models, name="mistakemate-ocr-model-download", daemon=True).start()
+    return get_ocr_model_status()
+
+
+@app.post("/api/settings/ocr-models/cancel", response_model=OcrModelStatusResponse)
+def cancel_ocr_models_download(user: AppUser = Depends(require_user)) -> OcrModelStatusResponse:
+    with ocr_model_download_lock:
+        if ocr_model_download_state["status"] not in {"downloading", "extracting"}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="当前没有进行中的 OCR 模型下载。")
+        ocr_model_download_cancel.set()
+        ocr_model_download_state["message"] = "正在停止下载…"
+    return get_ocr_model_status()
+
+
 @app.get("/api/mistakes", response_model=list[MistakeBatchResponse])
 def list_mistakes(subject: str | None = None, user: AppUser = Depends(require_user)) -> list[MistakeBatchResponse]:
     statement = (
@@ -1514,6 +1744,8 @@ def get_uploaded_file(batch_id: str, file_id: str, user: AppUser = Depends(requi
 
 @app.post("/api/mistakes/{batch_id}/ocr", response_model=OcrRunResponse, status_code=status.HTTP_202_ACCEPTED)
 def request_ocr(batch_id: str, background_tasks: BackgroundTasks, replace_question: bool = False, user: AppUser = Depends(require_user)) -> OcrRunResponse:
+    if not ocr_models_ready():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="本地 OCR 模型尚未下载，请先在“OCR 模型”页面完成下载。")
     with SessionLocal.begin() as session:
         batch = get_owned_batch(session, batch_id, user.id)
         run = session.get(OcrRun, batch_id)

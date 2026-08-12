@@ -7,6 +7,7 @@ const props = defineProps<{ part: QuestionPart; child?: boolean }>()
 const emit = defineEmits<{ remove: []; addChild: [] }>()
 
 const isGroup = computed(() => props.part.part_type === '题组说明')
+const hasAnswerContent = computed(() => props.part.answers.some((answer) => answer.trim()) || Boolean(props.part.solution.trim()))
 const availableTypes = computed(() => props.child
   ? ['填空题', '计算题', '证明题', '简答题', '选择题', '判断题', '其他']
   : ['题组说明', '填空题', '计算题', '证明题', '简答题', '选择题', '判断题', '其他'])
@@ -62,26 +63,31 @@ function addKeyPoint() {
     <p v-if="isGroup" class="group-hint">分组只保存共同条件，答案填写在下面的子问中。</p>
 
     <template v-else>
-      <section v-if="part.part_type === '填空题'" class="answers-section" :aria-label="`${part.label}填空答案`">
-        <div class="section-title"><div><strong>填空答案</strong><span>每个空单独填写，打印时会按顺序对应</span></div><button type="button" @click="addAnswer"><Plus :size="16" />增加一空</button></div>
-        <div class="answer-list">
-          <div v-for="(_, answerIndex) in part.answers" :key="answerIndex" class="answer-row">
-            <label :for="`part-${part.id}-answer-${answerIndex}`">第 {{ answerIndex + 1 }} 空</label>
-            <input :id="`part-${part.id}-answer-${answerIndex}`" v-model="part.answers[answerIndex]" placeholder="填写标准答案" />
-            <button type="button" :disabled="part.answers.length <= 1" :aria-label="`移除第 ${answerIndex + 1} 空`" @click="removeAnswer(answerIndex)"><Trash2 :size="16" /></button>
-          </div>
+      <details class="answer-details" :open="hasAnswerContent">
+        <summary>答案与解析 <span>可选，不填写也能确认题目</span><small v-if="hasAnswerContent">已填写</small></summary>
+        <div class="answer-content">
+          <section v-if="part.part_type === '填空题'" class="answers-section" :aria-label="`${part.label}填空答案`">
+            <div class="section-title"><div><strong>填空答案</strong><span>有答案时每个空单独填写</span></div><button type="button" @click="addAnswer"><Plus :size="16" />增加一空</button></div>
+            <div class="answer-list">
+              <div v-for="(_, answerIndex) in part.answers" :key="answerIndex" class="answer-row">
+                <label :for="`part-${part.id}-answer-${answerIndex}`">第 {{ answerIndex + 1 }} 空</label>
+                <input :id="`part-${part.id}-answer-${answerIndex}`" v-model="part.answers[answerIndex]" placeholder="可暂不填写" />
+                <button type="button" :disabled="part.answers.length <= 1" :aria-label="`移除第 ${answerIndex + 1} 空`" @click="removeAnswer(answerIndex)"><Trash2 :size="16" /></button>
+              </div>
+            </div>
+          </section>
+
+          <label v-else class="answer-field">
+            <span>最终答案 <small>可选</small></span>
+            <input v-model="part.answers[0]" placeholder="有答案时再填写" />
+          </label>
+
+          <label class="solution-field">
+            <span>标准解答 / 过程 <small>可选，用于答案版和以后按步骤批改</small></span>
+            <textarea v-model="part.solution" rows="4" placeholder="有完整解答时再补充"></textarea>
+          </label>
         </div>
-      </section>
-
-      <label v-else class="answer-field">
-        <span>最终答案 <small>{{ part.part_type === '证明题' ? '证明题可以留空' : '填写最终结论或结果' }}</small></span>
-        <input v-model="part.answers[0]" placeholder="例如：9、x=2、选 A" />
-      </label>
-
-      <label class="solution-field">
-        <span>标准解答 / 过程 <small>用于答案版和以后按步骤批改</small></span>
-        <textarea v-model="part.solution" rows="4" placeholder="填写完整推导、证明或解题步骤"></textarea>
-      </label>
+      </details>
 
       <details class="part-details">
         <summary>关键得分点与复练设置</summary>
@@ -118,10 +124,17 @@ input:focus,textarea:focus,select:focus,button:focus-visible,summary:focus-visib
 .part-actions button,.section-title button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 5px; padding: 8px 10px; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
 .add-child,.section-title button { color: #285fae; border: 1px solid #b9d1ef; }
 .remove-part { color: #a84b3d; border: 1px solid #e5bbb4; }
-.prompt-field,.answer-field,.solution-field,.answers-section,.part-details { margin-top: 16px; }
+.prompt-field,.part-details,.answer-details { margin-top: 16px; }
+.answer-field,.solution-field,.answers-section { margin-top: 0; }
+.solution-field { margin-top: 14px; }
 .answer-field span,.solution-field span { display: flex; align-items: baseline; gap: 7px; }
 small,.section-title span { color: #7b8fa3; font-size: 11px; font-weight: 500; }
 .group-hint { margin: 10px 0 0; color: #667f99; font-size: 12px; }
+.answer-details { overflow: hidden; border: 1px solid #d8e5f2; border-radius: 9px; background: #f8fbff; }
+.answer-details summary { display: flex; min-height: 44px; box-sizing: border-box; align-items: center; gap: 7px; padding: 12px 14px; color: #355875; font-size: 13px; font-weight: 700; cursor: pointer; }
+.answer-details summary span { color: #71879c; font-size: 11px; font-weight: 500; }
+.answer-details summary small { margin-left: auto; padding: 3px 6px; color: #247358; border-radius: 5px; background: #e8f7f0; }
+.answer-content { padding: 2px 14px 14px; }
 .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .section-title > div { display: grid; gap: 3px; color: #3a5570; font-size: 13px; }
 .answer-list,.key-point-list { display: grid; gap: 9px; margin-top: 10px; }

@@ -386,7 +386,7 @@ def build_structure_suggestion(stem: str) -> StructureSuggestionResponse:
     return StructureSuggestionResponse(stem=common_stem or stem, parts=parts)
 
 
-def save_question_parts(session: Any, question: MistakeQuestion, payloads: list[QuestionPartPayload], confirming: bool) -> None:
+def save_question_parts(session: Any, question: MistakeQuestion, payloads: list[QuestionPartPayload]) -> None:
     if len(payloads) > 30:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="一道题最多添加 30 个小问或分组。")
 
@@ -424,12 +424,6 @@ def save_question_parts(session: Any, question: MistakeQuestion, payloads: list[
 
         answers = [answer.strip()[:1000] for answer in payload.answers]
         solution = payload.solution.strip()[:12000]
-        if confirming and payload.part_type != "题组说明":
-            if payload.part_type == "填空题" and (not answers or any(not answer for answer in answers)):
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"请补全小问 {payload.label} 的所有填空答案。")
-            if payload.part_type != "填空题" and not any(answers) and not solution:
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"请填写小问 {payload.label} 的答案或解题过程。")
-
         part_id = id_mapping[payload_id]
         part = existing_by_id.get(part_id)
         if part is None:
@@ -869,7 +863,7 @@ def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUp
         question.knowledge_points = payload.knowledge_points.strip()[:1000]
         question.difficulty = payload.difficulty
         question.error_type = payload.error_type.strip()[:32]
-        save_question_parts(session, question, payload.parts, payload.status == "confirmed")
+        save_question_parts(session, question, payload.parts)
         question.status = payload.status
         question.updated_at = datetime.now(timezone.utc)
         batch = session.get(UploadBatch, batch_id)

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { CheckCircle2, CircleAlert, Layers3, LoaderCircle, Plus, Save, Sparkles, Trash2 } from '@lucide/vue'
+import { CheckCircle2, CircleAlert, FileText, Layers3, LoaderCircle, Plus, Save, Sparkles, Trash2 } from '@lucide/vue'
 import QuestionPartEditor from './QuestionPartEditor.vue'
 import type { MistakeQuestion, QuestionPart } from '../types/questions'
 
@@ -31,6 +31,7 @@ const saveError = ref('')
 const hasParts = computed(() => draft.parts.length > 0)
 const rootParts = computed(() => draft.parts.filter((part) => !part.parent_id).sort((a, b) => a.position - b.position))
 const answerablePartCount = computed(() => draft.parts.filter((part) => part.part_type !== '题组说明').length)
+const hasSimpleAnswer = computed(() => Boolean(draft.correct_answer.trim() || draft.explanation.trim()))
 const circledLabels = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
 
 watch(() => props.question, (question) => {
@@ -123,7 +124,7 @@ async function save(status: 'draft' | 'confirmed') {
     const payload = await response.json().catch(() => ({ detail: '保存失败，请稍后重试。' }))
     if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : '请检查小问内容后重试。')
     emit('saved', payload)
-    feedback.value = status === 'confirmed' ? '题目已确认，可以进入错题集和复练安排。' : '已保存为草稿。'
+    feedback.value = status === 'confirmed' ? '题目已确认，可以进入错题集并用于后续打印。' : '已保存为草稿。'
   } catch (error) {
     saveError.value = error instanceof Error ? error.message : '保存失败，请稍后重试。'
   } finally {
@@ -141,6 +142,7 @@ async function save(status: 'draft' | 'confirmed') {
 
     <p v-if="saveError" class="editor-error" role="alert"><CircleAlert :size="17" />{{ saveError }}</p>
     <p v-else-if="feedback" class="editor-success" role="status" aria-live="polite"><CheckCircle2 :size="17" />{{ feedback }}</p>
+    <p class="answer-optional-note"><FileText :size="17" /><span><strong>答案不是必填项</strong>只要题干和小问完整，就能确认并用于练习版打印；答案以后可以随时补充。</span></p>
 
     <div class="editor-grid">
       <label class="wide-field">{{ hasParts ? '公共题干' : '题干' }} <span>必填</span><textarea v-model="draft.stem" rows="5" :placeholder="hasParts ? '填写所有小问共同使用的题目背景和条件' : '补充或修正题干文字'"></textarea></label>
@@ -150,7 +152,7 @@ async function save(status: 'draft' | 'confirmed') {
 
     <section v-if="!hasParts" class="options-section" aria-labelledby="options-heading">
       <div class="field-heading"><div><p class="eyebrow">选择题可编辑</p><h3 id="options-heading">选项</h3></div><button class="text-action" type="button" @click="addOption"><Plus :size="17" />添加选项</button></div>
-      <p v-if="!draft.options.length" class="empty-options">这不是选择题？可以不添加选项，直接填写题干和答案。</p>
+      <p v-if="!draft.options.length" class="empty-options">这不是选择题？可以不添加选项，直接保存完整题干，需要时再补答案。</p>
       <div v-else class="option-list"><div v-for="(option, index) in draft.options" :key="`${option.label}-${index}`" class="option-row"><label :for="`option-label-${question.id}-${index}`">编号</label><input :id="`option-label-${question.id}-${index}`" v-model="option.label" maxlength="8" /><label :for="`option-text-${question.id}-${index}`" class="sr-only">选项内容</label><textarea :id="`option-text-${question.id}-${index}`" v-model="option.text" rows="2" placeholder="选项内容"></textarea><button class="remove-option" type="button" :aria-label="`移除选项 ${option.label || index + 1}`" @click="removeOption(index)"><Trash2 :size="17" /></button></div></div>
     </section>
 
@@ -173,10 +175,10 @@ async function save(status: 'draft' | 'confirmed') {
       </div>
     </section>
 
-    <div v-if="!hasParts" class="editor-grid answer-grid">
-      <label>正确答案<input v-model="draft.correct_answer" maxlength="128" placeholder="例如：A、247；180、x=2"></label>
-      <label class="wide-field">解析 <span>可选</span><textarea v-model="draft.explanation" rows="5" placeholder="补充或修正解析；公式和图形仍建议以原图为准。"></textarea></label>
-    </div>
+    <details v-if="!hasParts" class="simple-answer-details" :open="hasSimpleAnswer">
+      <summary>答案与解析 <span>可选，不填写也能确认题目</span><small v-if="hasSimpleAnswer">已填写</small></summary>
+      <div class="editor-grid answer-grid"><label>正确答案 <span>可选</span><input v-model="draft.correct_answer" maxlength="128" placeholder="有答案时再填写"></label><label class="wide-field">解析 <span>可选</span><textarea v-model="draft.explanation" rows="5" placeholder="有解析时再补充；公式和图形仍建议以原图为准。"></textarea></label></div>
+    </details>
 
     <div class="editor-grid metadata-grid">
       <label>整题错因<select v-model="draft.error_type"><option value="">暂不填写</option><option>计算错误</option><option>审题不清</option><option>概念不牢</option><option>方法不会</option><option>粗心遗漏</option><option>其他</option></select></label>
@@ -196,6 +198,7 @@ async function save(status: 'draft' | 'confirmed') {
 .editor-heading p:last-child,.structure-heading p { max-width: 680px; margin: 7px 0 0; color: #617991; font-size: 13px; line-height: 1.55; }
 .draft-chip { flex: 0 0 auto; padding: 6px 9px; color: #92651e; border-radius: 6px; background: #fff4d7; font-size: 11px; font-weight: 700; }.draft-chip.confirmed { color: #23785d; background: #e8f7f0; }
 .editor-error,.editor-success { display: flex; align-items: center; gap: 7px; margin: 16px 0 0; padding: 11px; border-radius: 8px; font-size: 13px; }.editor-error { color: #a84436; background: #fff4f2; }.editor-success { color: #247358; background: #edf9f3; }
+.answer-optional-note { display: flex; align-items: flex-start; gap: 9px; margin: 16px 0 0; padding: 12px 14px; color: #4e6d8a; border: 1px solid #d7e6f5; border-radius: 9px; background: #f6faff; font-size: 12px; line-height: 1.55; }.answer-optional-note svg { flex: 0 0 auto; margin-top: 1px; color: #3975cf; }.answer-optional-note span { display: grid; gap: 2px; }.answer-optional-note strong { color: #294f78; font-size: 13px; }
 .editor-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 15px; margin-top: 20px; }
 .editor-grid > label,.difficulty-field { display: grid; gap: 7px; color: #405a75; font-size: 12px; font-weight: 700; }.editor-grid span { color: #8597a8; font-size: 11px; font-weight: 500; }.wide-field { grid-column: 1 / -1; }
 .editor-grid input,.editor-grid textarea,.editor-grid select,.option-row input,.option-row textarea { box-sizing: border-box; width: 100%; color: #2d4662; border: 1px solid #c9d8e6; border-radius: 8px; background: #fff; font: inherit; font-size: 14px; line-height: 1.55; }.editor-grid input,.editor-grid select { min-height: 44px; padding: 0 11px; }.editor-grid textarea { padding: 10px 11px; resize: vertical; }
@@ -206,7 +209,7 @@ async function save(status: 'draft' | 'confirmed') {
 .text-action,.add-part-button,.add-group-button { color: #285fae; border: 1px solid #b9d1ef; }.suggest-button { color: #fff; border: 1px solid #2563eb; background: #2563eb !important; }.structure-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }.structure-actions button:disabled { cursor: wait; opacity: .65; }
 .option-list,.part-list { display: grid; gap: 11px; margin-top: 15px; }.option-row { display: grid; grid-template-columns: 40px 48px minmax(0,1fr) 44px; gap: 8px; align-items: center; }.option-row > label:first-child { color: #6f8398; font-size: 11px; font-weight: 700; }.option-row input { min-height: 44px; padding: 0 8px; text-align: center; }.option-row textarea { min-height: 44px; padding: 9px; resize: vertical; }.remove-option { display: grid; width: 44px; height: 44px; place-items: center; color: #9f4b40; border: 0; border-radius: 8px; background: #fff3f0; cursor: pointer; }.empty-options { margin: 13px 0 0; color: #71859a; font-size: 13px; }
 .simple-mode-button { justify-self: start; min-height: 44px; padding: 8px 12px; color: #8b534b; border: 1px solid #e5c2bc; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
-.answer-grid,.metadata-grid { margin-top: 23px; }.editor-actions { align-items: center; margin-top: 24px; padding-top: 17px; border-top: 1px solid #e0e7ee; }.editor-actions p { display: flex; align-items: flex-start; gap: 7px; margin: 0; color: #657b92; font-size: 12px; line-height: 1.5; }.editor-actions p span { color: #2f9a75; font-size: 14px; }.editor-actions > div { display: flex; gap: 9px; }.editor-actions button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 6px; padding: 9px 13px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }.draft-button { color: #315f9b; border: 1px solid #b9cee5; background: #fff; }.confirm-button { min-width: 122px; color: #fff; border: 1px solid #f97316; background: #f97316; }.editor-actions button:disabled { cursor: wait; opacity: .6; }
+.simple-answer-details { margin-top: 23px; overflow: hidden; border: 1px solid #d8e5f2; border-radius: 10px; background: #f8fbff; }.simple-answer-details summary { display: flex; min-height: 46px; box-sizing: border-box; align-items: center; gap: 7px; padding: 12px 16px; color: #355875; font-size: 13px; font-weight: 700; cursor: pointer; }.simple-answer-details summary span { color: #71879c; font-size: 11px; font-weight: 500; }.simple-answer-details summary small { margin-left: auto; padding: 3px 6px; color: #247358; border-radius: 5px; background: #e8f7f0; }.simple-answer-details .answer-grid { margin: 0; padding: 2px 16px 16px; }.metadata-grid { margin-top: 23px; }.editor-actions { align-items: center; margin-top: 24px; padding-top: 17px; border-top: 1px solid #e0e7ee; }.editor-actions p { display: flex; align-items: flex-start; gap: 7px; margin: 0; color: #657b92; font-size: 12px; line-height: 1.5; }.editor-actions p span { color: #2f9a75; font-size: 14px; }.editor-actions > div { display: flex; gap: 9px; }.editor-actions button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 6px; padding: 9px 13px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }.draft-button { color: #315f9b; border: 1px solid #b9cee5; background: #fff; }.confirm-button { min-width: 122px; color: #fff; border: 1px solid #f97316; background: #f97316; }.editor-actions button:disabled { cursor: wait; opacity: .6; }
 .spin { animation: rotate .8s linear infinite; }@keyframes rotate { to { transform: rotate(360deg); } }.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 @media (max-width: 760px) {
   .question-editor { margin-top: 18px; padding: 17px; }.editor-heading,.structure-heading,.editor-actions { align-items: stretch; flex-direction: column; }.draft-chip { align-self: flex-start; }.editor-grid { grid-template-columns: 1fr; gap: 14px; }.wide-field { grid-column: auto; }.options-section,.structure-section { padding: 15px; }.structure-actions { display: grid; grid-template-columns: 1fr 1fr; }.suggest-button { grid-column: 1 / -1; }.option-row { grid-template-columns: 43px minmax(0,1fr) 44px; }.option-row > label:first-child { display: none; }.option-row textarea { grid-column: 1 / -1; grid-row: 2; }.option-row input { grid-column: 1; grid-row: 1; }.remove-option { grid-column: 3; grid-row: 1; }.editor-actions > div { display: grid; grid-template-columns: 1fr 1.2fr; }.editor-actions button { width: 100%; }

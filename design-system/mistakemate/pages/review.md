@@ -23,6 +23,7 @@
 
 - Keep the common stem once, then show root parts and indented child parts in reading order.
 - Use progressive disclosure: final answers stay visible; scoring points, answer space, per-part difficulty, knowledge points, and error type live behind an expandable section.
-- Fill-in questions use one labelled answer input per blank. Calculation and proof questions separate the final answer from the full solution.
+- Answers are optional. Keep answer and solution inputs inside a clearly labelled disclosure, collapsed when empty, so question-only collection remains the primary path.
+- When answers are provided, fill-in questions use one labelled input per blank; calculation and proof questions separate the final answer from the full solution.
 - Automatic structure detection changes only the current draft until the user explicitly saves it.
 - Preserve the simple single-answer form when no numbered parts are detected.

@@ -506,6 +506,10 @@ def get_fernet() -> Fernet:
     return Fernet(key)
 
 
+def fernet_from_secret(secret: str) -> Fernet:
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+
+
 def encrypt_api_key(api_key: str) -> str:
     return get_fernet().encrypt(api_key.encode()).decode() if api_key else ""
 
@@ -514,7 +518,12 @@ def decrypt_api_key(encrypted_api_key: str) -> str:
     try:
         return get_fernet().decrypt(encrypted_api_key.encode()).decode() if encrypted_api_key else ""
     except InvalidToken as error:
-        raise RuntimeError("AI 密钥无法解密，请在设置页重新保存。") from error
+        # One release used this value before internal keys were stored in PostgreSQL.
+        # Keep this small compatibility path so an existing configured key keeps working.
+        try:
+            return fernet_from_secret("mistakemate-local-ai-change-me").decrypt(encrypted_api_key.encode()).decode()
+        except InvalidToken:
+            raise RuntimeError("AI 密钥无法解密，请在设置页重新保存。") from error
 
 
 def normalize_ai_base_url(value: str) -> str:

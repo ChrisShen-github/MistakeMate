@@ -228,6 +228,13 @@ class MistakeBatchDetailResponse(MistakeBatchResponse):
     questions: list[MistakeQuestionResponse]
 
 
+class PrintableQuestionResponse(MistakeQuestionResponse):
+    batch_id: str
+    subject: str
+    source: str
+    batch_created_at: datetime
+
+
 ocr_model: Any | None = None
 ocr_model_lock = Lock()
 OPTION_LABEL_PATTERN = re.compile(r"^([A-H])(?:[.、．:：]\s*|\s+|$)(.*)$")
@@ -515,7 +522,7 @@ def build_question_draft(ocr_text: str) -> MistakeQuestion:
     )
 
 
-def create_question_draft_if_missing(session: Any, batch_id: str, ocr_text: str) -> None:
+def create_question_draft_if_missing(session: Any, batch_id: str, ocr_text: str, force_replace: bool = False) -> None:
     existing = session.execute(select(MistakeQuestion).where(MistakeQuestion.batch_id == batch_id).limit(1)).scalar_one_or_none()
     if existing is None and ocr_text.strip():
         question = build_question_draft(ocr_text)
@@ -523,10 +530,16 @@ def create_question_draft_if_missing(session: Any, batch_id: str, ocr_text: str)
         session.add(question)
     elif (
         existing is not None
-        and existing.status == "draft"
-        and not existing.knowledge_points
-        and not existing.error_type
-        and existing.updated_at <= existing.created_at + timedelta(seconds=2)
+        and ocr_text.strip()
+        and (
+            force_replace
+            or (
+                existing.status == "draft"
+                and not existing.knowledge_points
+                and not existing.error_type
+                and existing.updated_at <= existing.created_at + timedelta(seconds=2)
+            )
+        )
     ):
         refreshed = build_question_draft(ocr_text)
         existing.question_type = refreshed.question_type
@@ -534,6 +547,10 @@ def create_question_draft_if_missing(session: Any, batch_id: str, ocr_text: str)
         existing.options = refreshed.options
         existing.correct_answer = refreshed.correct_answer
         existing.explanation = refreshed.explanation
+        if force_replace:
+            existing.status = "draft"
+            for part in list(existing.parts):
+                session.delete(part)
         existing.updated_at = datetime.now(timezone.utc)
 
 
@@ -644,7 +661,7 @@ def result_to_dict(result: Any) -> dict[str, Any]:
     return json.loads(json.dumps(result, default=str))
 
 
-def run_ocr(batch_id: str) -> None:
+def run_ocr(batch_id: str, replace_question: bool = False) -> None:
     with SessionLocal.begin() as session:
         batch = session.get(UploadBatch, batch_id)
         run = session.get(OcrRun, batch_id)
@@ -678,6 +695,10 @@ def run_ocr(batch_id: str) -> None:
                         recognized = payload.get("res", payload).get("rec_texts", [])
                         text_lines.extend(str(line) for line in recognized if str(line).strip())
 
+        recognized_text = "\n".join(text_lines).strip()
+        if not recognized_text:
+            raise RuntimeError("没有识别出可编辑文字，请调整裁剪范围或换一张更清晰的图片后重试。")
+
         with SessionLocal.begin() as session:
             batch = session.get(UploadBatch, batch_id)
             run = session.get(OcrRun, batch_id)
@@ -685,10 +706,10 @@ def run_ocr(batch_id: str) -> None:
                 return
             batch.status = "review_ready"
             run.status = "completed"
-            run.text = "\n".join(text_lines)
+            run.text = recognized_text
             run.raw_result = json.dumps(results, ensure_ascii=False)
             run.completed_at = datetime.now(timezone.utc)
-            create_question_draft_if_missing(session, batch_id, run.text)
+            create_question_draft_if_missing(session, batch_id, run.text, force_replace=replace_question)
     except Exception as error:
         with SessionLocal.begin() as session:
             batch = session.get(UploadBatch, batch_id)
@@ -762,6 +783,31 @@ def list_mistakes(subject: str | None = None) -> list[MistakeBatchResponse]:
     ]
 
 
+@app.get("/api/print/questions", response_model=list[PrintableQuestionResponse])
+def list_printable_questions(subject: str | None = None) -> list[PrintableQuestionResponse]:
+    statement = (
+        select(MistakeQuestion, UploadBatch)
+        .join(UploadBatch, MistakeQuestion.batch_id == UploadBatch.id)
+        .where(MistakeQuestion.status == "confirmed")
+        .order_by(UploadBatch.created_at.desc(), MistakeQuestion.position.asc())
+    )
+    if subject:
+        statement = statement.where(UploadBatch.subject == subject)
+
+    with SessionLocal() as session:
+        rows = session.execute(statement).all()
+        return [
+            PrintableQuestionResponse(
+                **to_question_response(question).model_dump(),
+                batch_id=batch.id,
+                subject=batch.subject,
+                source=batch.source,
+                batch_created_at=batch.created_at,
+            )
+            for question, batch in rows
+        ]
+
+
 @app.get("/api/mistakes/{batch_id}", response_model=MistakeBatchDetailResponse)
 def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
     with SessionLocal() as session:
@@ -809,7 +855,7 @@ def get_uploaded_file(batch_id: str, file_id: str) -> FileResponse:
 
 
 @app.post("/api/mistakes/{batch_id}/ocr", response_model=OcrRunResponse, status_code=status.HTTP_202_ACCEPTED)
-def request_ocr(batch_id: str, background_tasks: BackgroundTasks) -> OcrRunResponse:
+def request_ocr(batch_id: str, background_tasks: BackgroundTasks, replace_question: bool = False) -> OcrRunResponse:
     with SessionLocal.begin() as session:
         batch = session.get(UploadBatch, batch_id)
         if batch is None:
@@ -826,7 +872,7 @@ def request_ocr(batch_id: str, background_tasks: BackgroundTasks) -> OcrRunRespo
         run.started_at = None
         run.completed_at = None
 
-    background_tasks.add_task(run_ocr, batch_id)
+    background_tasks.add_task(run_ocr, batch_id, replace_question)
     return to_ocr_response(run)
 
 

@@ -22,6 +22,7 @@ import {
 import UploadWorkspace from './components/UploadWorkspace.vue'
 import MistakeLibrary from './components/MistakeLibrary.vue'
 import BatchReview from './components/BatchReview.vue'
+import PrintWorkspace from './components/PrintWorkspace.vue'
 
 type NavItem = {
   label: string
@@ -36,8 +37,9 @@ const navigation: NavItem[] = [
 ]
 
 const activeNav = ref('今日任务')
-const currentView = ref<'dashboard' | 'upload' | 'library' | 'review'>('dashboard')
+const currentView = ref<'dashboard' | 'upload' | 'library' | 'review' | 'print'>('dashboard')
 const previousView = ref<'dashboard' | 'library'>('dashboard')
+const previousPrintView = ref<'dashboard' | 'library'>('dashboard')
 const activeBatchId = ref('')
 const sidebarOpen = ref(false)
 const notice = ref('')
@@ -56,7 +58,7 @@ const subjects = [
 ]
 
 const activeTitle = computed(() => activeNav.value === '今日任务' ? '今天，先攻克最值得重做的题。' : activeNav.value)
-const currentCrumb = computed(() => currentView.value === 'upload' ? '上传错题' : currentView.value === 'library' ? '我的错题' : currentView.value === 'review' ? '检查错题' : activeNav.value)
+const currentCrumb = computed(() => currentView.value === 'upload' ? '上传错题' : currentView.value === 'library' ? '我的错题' : currentView.value === 'review' ? '检查错题' : currentView.value === 'print' ? '错题集打印' : activeNav.value)
 
 function showNotice(message: string) {
   notice.value = message
@@ -87,7 +89,27 @@ function openBatch(batchId: string) {
   currentView.value = 'review'
 }
 
+function openPrint() {
+  previousPrintView.value = currentView.value === 'library' ? 'library' : 'dashboard'
+  activeNav.value = '错题集'
+  currentView.value = 'print'
+  sidebarOpen.value = false
+}
+
+function closePrint() {
+  if (previousPrintView.value === 'library') {
+    openLibrary()
+  } else {
+    activeNav.value = '今日任务'
+    currentView.value = 'dashboard'
+  }
+}
+
 function selectNav(label: string) {
+  if (label === '错题集') {
+    openPrint()
+    return
+  }
   activeNav.value = label
   currentView.value = label === '我的错题' ? 'library' : 'dashboard'
   sidebarOpen.value = false
@@ -161,8 +183,9 @@ function onRecognitionQueued(count: number) {
       </header>
 
       <UploadWorkspace v-if="currentView === 'upload'" @back="closeUpload" @queued="onRecognitionQueued" />
-      <MistakeLibrary v-else-if="currentView === 'library'" @upload="openUpload" @open="openBatch($event.id)" />
+      <MistakeLibrary v-else-if="currentView === 'library'" @upload="openUpload" @print="openPrint" @open="openBatch($event.id)" />
       <BatchReview v-else-if="currentView === 'review'" :batch-id="activeBatchId" @back="openLibrary" />
+      <PrintWorkspace v-else-if="currentView === 'print'" @back="closePrint" />
 
       <section v-else class="dashboard">
         <div class="welcome-row">
@@ -238,8 +261,8 @@ function onRecognitionQueued(count: number) {
 
             <article class="print-card">
               <div class="print-icon"><Printer :size="21" /></div>
-              <div><p>本周错题集</p><strong>已整理 12 道题</strong><span>练习版与答案版均可打印</span></div>
-              <button class="white-button" @click="showNotice('错题集 PDF 将在后端接入后生成。')">去打印</button>
+              <div><p>错题集打印</p><strong>选择已确认题目</strong><span>练习版与答案版均可打印</span></div>
+              <button class="white-button" @click="openPrint">去打印</button>
             </article>
           </aside>
         </section>

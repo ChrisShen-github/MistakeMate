@@ -42,12 +42,14 @@ async function loadBatch() {
   }
 }
 
-async function startOcr() {
+async function startOcr(replaceQuestion = false) {
   if (isRequestingOcr.value) return
+  if (replaceQuestion && !window.confirm('重新识别会覆盖当前题干、选项和 OCR 答案初稿，并清空已拆分的小问；难度、知识点和错因会保留。确定继续吗？')) return
   isRequestingOcr.value = true
   errorMessage.value = ''
   try {
-    const response = await fetch(`/api/mistakes/${props.batchId}/ocr`, { method: 'POST' })
+    const query = replaceQuestion ? '?replace_question=true' : ''
+    const response = await fetch(`/api/mistakes/${props.batchId}/ocr${query}`, { method: 'POST' })
     const payload = await response.json().catch(() => ({ detail: '无法启动本地识别。' }))
     if (!response.ok) throw new Error(payload.detail)
     await loadBatch()
@@ -84,14 +86,14 @@ onBeforeUnmount(clearRefreshTimer)
         <span class="status-chip" :class="{ confirmed: batch.status === 'confirmed' }">{{ batch.status === 'confirmed' ? '题目已确认' : ocrLabel(batch.ocr?.status) }}</span>
       </header>
 
-      <section class="review-tip" :class="{ confirmed: batch.status === 'confirmed' }"><CheckCircle2 v-if="batch.status === 'confirmed'" :size="19" /><Info v-else :size="19" /><div><strong>{{ batch.status === 'confirmed' ? '题目已确认，已进入错题库' : batch.ocr?.status === 'completed' ? '本地识别已完成，请核对文字' : '原图已保存，可开始本地识别' }}</strong><p>{{ batch.status === 'confirmed' ? '可以继续修改并重新确认；也可以返回“我的错题”，后续加入打印练习。' : batch.ocr?.status === 'completed' ? '识别结果仅作初稿，尤其是手写字符、公式和步骤，请在后续题目确认页核对。' : '使用开源 PaddleOCR 在本机处理，不会把题图上传到第三方服务。首次识别会下载模型，时间会更长。' }}</p></div><button v-if="!batch.ocr || batch.ocr.status === 'failed'" class="ocr-button" type="button" :disabled="isRequestingOcr" @click="startOcr"><ScanText :size="17" />{{ isRequestingOcr ? '正在启动…' : '开始识别' }}</button><span v-else-if="['queued', 'running'].includes(batch.ocr.status)" class="ocr-progress"><LoaderCircle class="spin" :size="17" />{{ ocrLabel(batch.ocr.status) }}</span></section>
+      <section class="review-tip" :class="{ confirmed: batch.status === 'confirmed' }"><CheckCircle2 v-if="batch.status === 'confirmed'" :size="19" /><Info v-else :size="19" /><div><strong>{{ batch.status === 'confirmed' ? '题目已确认，已进入错题库' : batch.ocr?.status === 'completed' ? '本地识别已完成，请核对文字' : '原图已保存，可开始本地识别' }}</strong><p>{{ batch.status === 'confirmed' ? '可以继续修改并重新确认；如果识别内容不完整，也可以重新识别原图。' : batch.ocr?.status === 'completed' ? '识别结果仅作初稿，尤其是手写字符、公式和步骤，请在后续题目确认页核对。' : '使用开源 PaddleOCR 在本机处理，不会把题图上传到第三方服务。首次识别会下载模型，时间会更长。' }}</p></div><button v-if="!batch.ocr || batch.ocr.status === 'failed'" class="ocr-button" type="button" :disabled="isRequestingOcr" @click="startOcr(false)"><ScanText :size="17" />{{ isRequestingOcr ? '正在启动…' : '开始识别' }}</button><button v-else-if="batch.ocr.status === 'completed'" class="reocr-button" type="button" :disabled="isRequestingOcr" @click="startOcr(true)"><LoaderCircle v-if="isRequestingOcr" class="spin" :size="17" /><RefreshCw v-else :size="17" />{{ isRequestingOcr ? '正在启动…' : '重新识别' }}</button><span v-else-if="['queued', 'running'].includes(batch.ocr.status)" class="ocr-progress"><LoaderCircle class="spin" :size="17" />{{ ocrLabel(batch.ocr.status) }}</span></section>
 
       <template v-if="batch.ocr?.status === 'completed'">
         <QuestionEditor v-for="question in batch.questions" :key="question.id" :batch-id="batch.id" :question="question" @saved="updateQuestion" @finished="emit('back')" />
         <section v-if="!batch.questions.length" class="ocr-result" aria-labelledby="ocr-result-heading"><div class="section-heading"><div><p class="eyebrow">OCR 初稿</p><h2 id="ocr-result-heading">识别出的文字</h2></div><span>{{ batch.ocr.engine }}</span></div><p class="empty-draft">正在生成可编辑题目，请稍后刷新。</p></section>
         <details class="ocr-raw"><summary>查看 OCR 原始文字</summary><pre>{{ batch.ocr.text || '没有识别出可编辑文字，请检查图片清晰度后重试。' }}</pre></details>
       </template>
-      <section v-else-if="batch.ocr?.status === 'failed'" class="ocr-failed" role="alert"><CircleAlert :size="19" /><div><strong>本地识别未完成</strong><p>{{ batch.ocr.error_message || '请检查模型下载与文件格式后重试。' }}</p></div><button type="button" @click="startOcr"><RefreshCw :size="16" />重试</button></section>
+      <section v-else-if="batch.ocr?.status === 'failed'" class="ocr-failed" role="alert"><CircleAlert :size="19" /><div><strong>本地识别未完成</strong><p>{{ batch.ocr.error_message || '请检查模型下载与文件格式后重试。' }}</p></div><button type="button" @click="startOcr(false)"><RefreshCw :size="16" />重试</button></section>
 
       <section v-if="imageFiles.length" class="preview-section" aria-labelledby="preview-heading"><div class="section-heading"><div><p class="eyebrow">原图预览</p><h2 id="preview-heading">可直接查看的图片</h2></div><span>{{ imageFiles.length }} 张</span></div><div class="image-grid"><a v-for="file in imageFiles" :key="file.id" class="image-card" :href="fileUrl(file)" target="_blank" rel="noreferrer"><img :src="fileUrl(file)" :alt="`原图：${file.original_name}`" /><span>{{ file.original_name }}</span></a></div></section>
 
@@ -107,4 +109,7 @@ onBeforeUnmount(clearRefreshTimer)
 .status-chip.confirmed { color: #23785d; background: #e8f7f0; }
 .review-tip.confirmed { color: #2a6552; border-color: #bee5d5; background: #f1fbf7; }
 .review-tip.confirmed > svg { color: #2f9a75; }
+.reocr-button { display: inline-flex; min-height: 44px; flex: 0 0 auto; align-items: center; justify-content: center; gap: 6px; padding: 9px 12px; color: #315f9b; border: 1px solid #a9c6e9; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
+.reocr-button:hover { color: #184f9f; border-color: #789fd3; background: #f7fbff; }
+@media (max-width: 760px) { .reocr-button { width: 100%; } }
 </style>

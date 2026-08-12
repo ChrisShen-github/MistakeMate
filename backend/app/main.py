@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import os
+import secrets
 import shutil
 import json
 import math
@@ -14,12 +18,15 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 from uuid import uuid4
+from urllib.error import HTTPError, URLError
+from urllib.request import Request as UrlRequest, urlopen
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, status
+from cryptography.fernet import Fernet, InvalidToken
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func, select
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func, inspect, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -28,6 +35,10 @@ MAX_FILES_PER_BATCH = 12
 CHUNK_SIZE = 1024 * 1024
 ALLOWED_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/heic", "image/heif", "image/webp"}
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".pdf"}
+SESSION_COOKIE = "mistakemate_session"
+SESSION_DAYS = 30
+auth_secret = os.getenv("AUTH_SECRET", "mistakemate-change-this-secret")
+ai_config_secret = os.getenv("AI_CONFIG_SECRET", auth_secret)
 
 storage_root = Path(os.getenv("STORAGE_ROOT", "storage")).resolve()
 database_url = os.getenv("DATABASE_URL", "sqlite:///storage/mistakemate.db")
@@ -42,10 +53,21 @@ class Base(DeclarativeBase):
     pass
 
 
+class AppUser(Base):
+    __tablename__ = "app_users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(64))
+    password_hash: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class UploadBatch(Base):
     __tablename__ = "upload_batches"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     subject: Mapped[str] = mapped_column(String(32))
     source: Mapped[str] = mapped_column(String(32))
     note: Mapped[str] = mapped_column(Text, default="")
@@ -78,6 +100,12 @@ class OcrRun(Base):
     error_message: Mapped[str] = mapped_column(Text, default="")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ai_status: Mapped[str] = mapped_column(String(32), default="not_requested")
+    ai_text: Mapped[str] = mapped_column(Text, default="")
+    ai_error_message: Mapped[str] = mapped_column(Text, default="")
+    ai_model: Mapped[str] = mapped_column(String(128), default="")
+    ai_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ai_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class OcrRegion(Base):
@@ -135,9 +163,24 @@ class PrintTemplate(Base):
     __tablename__ = "print_templates"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(80))
     settings: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class AiProviderConfig(Base):
+    __tablename__ = "ai_provider_configs"
+
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    base_url: Mapped[str] = mapped_column(String(512), default="https://api.openai.com/v1")
+    model: Mapped[str] = mapped_column(String(128), default="")
+    encrypted_api_key: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -175,6 +218,52 @@ class OcrRunResponse(BaseModel):
     error_message: str
     started_at: datetime | None
     completed_at: datetime | None
+    ai_status: str
+    ai_text: str
+    ai_error_message: str
+    ai_model: str
+    ai_started_at: datetime | None
+    ai_completed_at: datetime | None
+
+
+class UserResponse(BaseModel):
+    id: str
+    username: str
+    display_name: str
+
+
+class AuthBootstrapResponse(BaseModel):
+    has_users: bool
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    display_name: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class AiConfigUpdateRequest(BaseModel):
+    base_url: str = Field(min_length=8, max_length=512)
+    model: str = Field(min_length=1, max_length=128)
+    api_key: str = Field(default="", max_length=512)
+    clear_api_key: bool = False
+
+
+class AiConfigResponse(BaseModel):
+    base_url: str
+    model: str
+    api_key_configured: bool
+    updated_at: datetime | None
+
+
+class AiConnectionResponse(BaseModel):
+    status: str
+    message: str
 
 
 class QuestionOption(BaseModel):
@@ -278,7 +367,121 @@ def to_ocr_response(run: OcrRun | None) -> OcrRunResponse | None:
         error_message=run.error_message,
         started_at=run.started_at,
         completed_at=run.completed_at,
+        ai_status=run.ai_status,
+        ai_text=run.ai_text,
+        ai_error_message=run.ai_error_message,
+        ai_model=run.ai_model,
+        ai_started_at=run.ai_started_at,
+        ai_completed_at=run.ai_completed_at,
     )
+
+
+def to_user_response(user: AppUser) -> UserResponse:
+    return UserResponse(id=user.id, username=user.username, display_name=user.display_name)
+
+
+def normalize_username(value: str) -> str:
+    username = value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_.-]{3,64}", username):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="用户名需为 3–64 位，可使用字母、数字、点、横线或下划线。",
+        )
+    return username
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+    return f"pbkdf2_sha256$310000${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, rounds, salt_value, digest_value = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = base64.urlsafe_b64decode(salt_value)
+        expected = base64.urlsafe_b64decode(digest_value)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(rounds))
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def create_session_token(user_id: str) -> str:
+    expires_at = int(time.time()) + SESSION_DAYS * 24 * 60 * 60
+    payload = base64.urlsafe_b64encode(f"{user_id}:{expires_at}".encode()).decode().rstrip("=")
+    signature = hmac.new(auth_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def parse_session_token(token: str) -> str | None:
+    try:
+        payload, signature = token.split(".", 1)
+        expected = hmac.new(auth_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode()
+        user_id, expires_at = decoded.rsplit(":", 1)
+        return user_id if int(expires_at) >= int(time.time()) else None
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def require_user(request: Request) -> AppUser:
+    user_id = parse_session_token(request.cookies.get(SESSION_COOKIE, ""))
+    if user_id:
+        with SessionLocal() as session:
+            user = session.get(AppUser, user_id)
+            if user is not None:
+                session.expunge(user)
+                return user
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录。")
+
+
+def set_session_cookie(response: Response, user_id: str, request: Request) -> None:
+    response.set_cookie(
+        SESSION_COOKIE,
+        create_session_token(user_id),
+        max_age=SESSION_DAYS * 24 * 60 * 60,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        path="/",
+    )
+
+
+def get_owned_batch(session: Any, batch_id: str, user_id: str) -> UploadBatch:
+    batch = session.execute(
+        select(UploadBatch).where(UploadBatch.id == batch_id, UploadBatch.owner_id == user_id)
+    ).scalar_one_or_none()
+    if batch is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这组错题。")
+    return batch
+
+
+def get_fernet() -> Fernet:
+    key = base64.urlsafe_b64encode(hashlib.sha256(ai_config_secret.encode()).digest())
+    return Fernet(key)
+
+
+def encrypt_api_key(api_key: str) -> str:
+    return get_fernet().encrypt(api_key.encode()).decode() if api_key else ""
+
+
+def decrypt_api_key(encrypted_api_key: str) -> str:
+    try:
+        return get_fernet().decrypt(encrypted_api_key.encode()).decode() if encrypted_api_key else ""
+    except InvalidToken as error:
+        raise RuntimeError("AI 密钥无法解密，请在设置页重新保存。") from error
+
+
+def normalize_ai_base_url(value: str) -> str:
+    base_url = value.strip().rstrip("/")
+    if not re.match(r"^https?://", base_url):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="接口地址需以 http:// 或 https:// 开头。")
+    return base_url
 
 
 def parse_string_list(value: str) -> list[str]:
@@ -747,12 +950,153 @@ def run_ocr(batch_id: str, replace_question: bool = False) -> None:
             run.completed_at = datetime.now(timezone.utc)
 
 
+def call_ai_chat(config: AiProviderConfig, messages: list[dict[str, Any]], max_tokens: int = 5000) -> str:
+    api_key = decrypt_api_key(config.encrypted_api_key)
+    if not api_key:
+        raise RuntimeError("尚未配置 AI API 密钥。")
+    request_body = json.dumps(
+        {"model": config.model, "messages": messages, "temperature": 0.1, "max_tokens": max_tokens},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = UrlRequest(
+        f"{config.base_url.rstrip('/')}/chat/completions",
+        data=request_body,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=90) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:800]
+        raise RuntimeError(f"AI 服务返回 {error.code}：{detail}") from error
+    except (URLError, TimeoutError) as error:
+        raise RuntimeError(f"无法连接 AI 服务：{error}") from error
+    try:
+        content = payload["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "\n".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
+        content = str(content).strip()
+    except (KeyError, IndexError, TypeError) as error:
+        raise RuntimeError("AI 服务返回格式不兼容 OpenAI Chat Completions。") from error
+    if not content:
+        raise RuntimeError("AI 没有返回可用文字。")
+    return content
+
+
+def build_ai_ocr_messages(batch_id: str, local_ocr_text: str) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                "请复核这些试题图片，并结合下面的本地 OCR 初稿，输出完整、可编辑的题面文字。"
+                "补全漏字，修正明显错字，保留题号、选项、小问、公式与换行。不要解题，不要添加答案，"
+                "不要解释；看不清的内容标记为［无法确认］。\n\n本地 OCR 初稿：\n" + local_ocr_text[:16000]
+            ),
+        }
+    ]
+    with SessionLocal() as session:
+        batch = session.get(UploadBatch, batch_id)
+        files = [] if batch is None else list(batch.files)
+        regions = {
+            file.id: session.get(OcrRegion, file.id)
+            for file in files
+        }
+    with tempfile.TemporaryDirectory(prefix="mistakemate-ai-ocr-") as temporary_path:
+        temporary_directory = Path(temporary_path)
+        image_count = 0
+        for file in files:
+            region = regions[file.id]
+            crop_region = (region.x, region.y, region.width, region.height) if region else None
+            source = storage_root / "uploads" / batch_id / file.stored_name
+            for input_path in prepare_ocr_inputs(source, file.original_name, temporary_directory, crop_region):
+                if image_count >= 8:
+                    break
+                from PIL import Image, ImageOps
+
+                compressed_path = temporary_directory / f"ai-{image_count + 1}.jpg"
+                with Image.open(input_path) as image:
+                    prepared = ImageOps.exif_transpose(image).convert("RGB")
+                    prepared.thumbnail((2600, 2600), Image.Resampling.LANCZOS)
+                    prepared.save(compressed_path, "JPEG", quality=88, optimize=True)
+                encoded = base64.b64encode(compressed_path.read_bytes()).decode()
+                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}", "detail": "high"}})
+                image_count += 1
+            if image_count >= 8:
+                break
+    if image_count == 0:
+        raise RuntimeError("没有可发送给 AI 的题目图片。")
+    return [
+        {"role": "system", "content": "你是谨慎的中文试题 OCR 复核助手，只按图片内容转写。"},
+        {"role": "user", "content": content},
+    ]
+
+
+def run_ai_ocr_assist(batch_id: str, user_id: str) -> None:
+    with SessionLocal.begin() as session:
+        batch = session.get(UploadBatch, batch_id)
+        run = session.get(OcrRun, batch_id)
+        config = session.get(AiProviderConfig, user_id)
+        if batch is None or batch.owner_id != user_id or run is None or config is None:
+            return
+        run.ai_status = "running"
+        run.ai_error_message = ""
+        run.ai_text = ""
+        run.ai_model = config.model
+        run.ai_started_at = datetime.now(timezone.utc)
+        run.ai_completed_at = None
+        local_ocr_text = run.text
+        session.expunge(config)
+    try:
+        ai_text = call_ai_chat(config, build_ai_ocr_messages(batch_id, local_ocr_text))
+        with SessionLocal.begin() as session:
+            run = session.get(OcrRun, batch_id)
+            if run is None:
+                return
+            run.ai_status = "completed"
+            run.ai_text = ai_text
+            run.ai_completed_at = datetime.now(timezone.utc)
+    except Exception as error:
+        with SessionLocal.begin() as session:
+            run = session.get(OcrRun, batch_id)
+            if run is None:
+                return
+            run.ai_status = "failed"
+            run.ai_error_message = str(error)[:2000]
+            run.ai_completed_at = datetime.now(timezone.utc)
+
+
+def ensure_legacy_columns() -> None:
+    schema = inspect(engine)
+    migrations = {
+        "upload_batches": [("owner_id", "VARCHAR(36)")],
+        "print_templates": [("user_id", "VARCHAR(36)")],
+        "ocr_runs": [
+            ("ai_status", "VARCHAR(32) NOT NULL DEFAULT 'not_requested'"),
+            ("ai_text", "TEXT NOT NULL DEFAULT ''"),
+            ("ai_error_message", "TEXT NOT NULL DEFAULT ''"),
+            ("ai_model", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ("ai_started_at", "TIMESTAMP"),
+            ("ai_completed_at", "TIMESTAMP"),
+        ],
+    }
+    with engine.begin() as connection:
+        for table_name, additions in migrations.items():
+            existing = {column["name"] for column in schema.get_columns(table_name)}
+            for column_name, definition in additions:
+                if column_name not in existing:
+                    connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_upload_batches_owner_id ON upload_batches (owner_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_print_templates_user_id ON print_templates (user_id)"))
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     storage_root.mkdir(parents=True, exist_ok=True)
     for attempt in range(30):
         try:
             Base.metadata.create_all(engine)
+            ensure_legacy_columns()
             break
         except OperationalError:
             if attempt == 29:
@@ -770,7 +1114,7 @@ app = FastAPI(title="MistakeMate API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:4173", "http://127.0.0.1:4173", "http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
@@ -781,12 +1125,112 @@ def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/auth/bootstrap", response_model=AuthBootstrapResponse)
+def auth_bootstrap() -> AuthBootstrapResponse:
+    with SessionLocal() as session:
+        return AuthBootstrapResponse(has_users=bool(session.scalar(select(func.count(AppUser.id)))))
+
+
+@app.post("/api/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def register_user(payload: RegisterRequest, response: Response, request: Request) -> UserResponse:
+    username = normalize_username(payload.username)
+    display_name = payload.display_name.strip()
+    with SessionLocal.begin() as session:
+        if session.scalar(select(AppUser).where(AppUser.username == username)) is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="这个用户名已被使用。")
+        first_user = not bool(session.scalar(select(func.count(AppUser.id))))
+        user = AppUser(id=str(uuid4()), username=username, display_name=display_name, password_hash=hash_password(payload.password))
+        session.add(user)
+        session.flush()
+        if first_user:
+            session.execute(update(UploadBatch).where(UploadBatch.owner_id.is_(None)).values(owner_id=user.id))
+            session.execute(update(PrintTemplate).where(PrintTemplate.user_id.is_(None)).values(user_id=user.id))
+    set_session_cookie(response, user.id, request)
+    return to_user_response(user)
+
+
+@app.post("/api/auth/login", response_model=UserResponse)
+def login_user(payload: LoginRequest, response: Response, request: Request) -> UserResponse:
+    username = payload.username.strip().lower()
+    with SessionLocal() as session:
+        user = session.scalar(select(AppUser).where(AppUser.username == username))
+        if user is None or not verify_password(payload.password, user.password_hash):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码不正确。")
+        session.expunge(user)
+    set_session_cookie(response, user.id, request)
+    return to_user_response(user)
+
+
+@app.post("/api/auth/logout")
+def logout_user(response: Response) -> dict[str, str]:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"status": "logged_out"}
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+def current_user(user: AppUser = Depends(require_user)) -> UserResponse:
+    return to_user_response(user)
+
+
+@app.get("/api/settings/ai", response_model=AiConfigResponse)
+def get_ai_config(user: AppUser = Depends(require_user)) -> AiConfigResponse:
+    with SessionLocal() as session:
+        config = session.get(AiProviderConfig, user.id)
+        if config is None:
+            return AiConfigResponse(base_url="https://api.openai.com/v1", model="", api_key_configured=False, updated_at=None)
+        return AiConfigResponse(
+            base_url=config.base_url,
+            model=config.model,
+            api_key_configured=bool(config.encrypted_api_key),
+            updated_at=config.updated_at,
+        )
+
+
+@app.put("/api/settings/ai", response_model=AiConfigResponse)
+def save_ai_config(payload: AiConfigUpdateRequest, user: AppUser = Depends(require_user)) -> AiConfigResponse:
+    base_url = normalize_ai_base_url(payload.base_url)
+    model = payload.model.strip()
+    with SessionLocal.begin() as session:
+        config = session.get(AiProviderConfig, user.id)
+        if config is None:
+            config = AiProviderConfig(user_id=user.id)
+            session.add(config)
+        config.base_url = base_url
+        config.model = model
+        if payload.clear_api_key:
+            config.encrypted_api_key = ""
+        elif payload.api_key.strip():
+            config.encrypted_api_key = encrypt_api_key(payload.api_key.strip())
+        config.updated_at = datetime.now(timezone.utc)
+    return AiConfigResponse(
+        base_url=config.base_url,
+        model=config.model,
+        api_key_configured=bool(config.encrypted_api_key),
+        updated_at=config.updated_at,
+    )
+
+
+@app.post("/api/settings/ai/test", response_model=AiConnectionResponse)
+def test_ai_connection(user: AppUser = Depends(require_user)) -> AiConnectionResponse:
+    with SessionLocal() as session:
+        config = session.get(AiProviderConfig, user.id)
+        if config is None or not config.model or not config.encrypted_api_key:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先保存完整的 AI 配置。")
+        session.expunge(config)
+    try:
+        result = call_ai_chat(config, [{"role": "user", "content": "只回复：连接成功"}], max_tokens=20)
+    except RuntimeError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+    return AiConnectionResponse(status="ok", message=result[:100])
+
+
 @app.get("/api/mistakes", response_model=list[MistakeBatchResponse])
-def list_mistakes(subject: str | None = None) -> list[MistakeBatchResponse]:
+def list_mistakes(subject: str | None = None, user: AppUser = Depends(require_user)) -> list[MistakeBatchResponse]:
     statement = (
         select(UploadBatch, func.count(UploadedFile.id).label("file_count"))
         .outerjoin(UploadedFile)
         .group_by(UploadBatch.id)
+        .where(UploadBatch.owner_id == user.id)
         .order_by(UploadBatch.created_at.desc())
     )
     if subject:
@@ -809,11 +1253,11 @@ def list_mistakes(subject: str | None = None) -> list[MistakeBatchResponse]:
 
 
 @app.get("/api/print/questions", response_model=list[PrintableQuestionResponse])
-def list_printable_questions(subject: str | None = None) -> list[PrintableQuestionResponse]:
+def list_printable_questions(subject: str | None = None, user: AppUser = Depends(require_user)) -> list[PrintableQuestionResponse]:
     statement = (
         select(MistakeQuestion, UploadBatch)
         .join(UploadBatch, MistakeQuestion.batch_id == UploadBatch.id)
-        .where(MistakeQuestion.status == "confirmed")
+        .where(MistakeQuestion.status == "confirmed", UploadBatch.owner_id == user.id)
         .order_by(UploadBatch.created_at.desc(), MistakeQuestion.position.asc())
     )
     if subject:
@@ -858,27 +1302,29 @@ def normalize_print_template(payload: PrintTemplatePayload) -> tuple[str, str]:
 
 
 @app.get("/api/print/templates", response_model=list[PrintTemplateResponse])
-def list_print_templates() -> list[PrintTemplateResponse]:
+def list_print_templates(user: AppUser = Depends(require_user)) -> list[PrintTemplateResponse]:
     with SessionLocal() as session:
-        templates = session.execute(select(PrintTemplate).order_by(PrintTemplate.updated_at.desc())).scalars().all()
+        templates = session.execute(
+            select(PrintTemplate).where(PrintTemplate.user_id == user.id).order_by(PrintTemplate.updated_at.desc())
+        ).scalars().all()
         return [to_print_template_response(template) for template in templates]
 
 
 @app.post("/api/print/templates", response_model=PrintTemplateResponse, status_code=status.HTTP_201_CREATED)
-def create_print_template(payload: PrintTemplatePayload) -> PrintTemplateResponse:
+def create_print_template(payload: PrintTemplatePayload, user: AppUser = Depends(require_user)) -> PrintTemplateResponse:
     name, settings = normalize_print_template(payload)
     with SessionLocal.begin() as session:
-        template = PrintTemplate(id=str(uuid4()), name=name, settings=settings)
+        template = PrintTemplate(id=str(uuid4()), user_id=user.id, name=name, settings=settings)
         session.add(template)
     return to_print_template_response(template)
 
 
 @app.put("/api/print/templates/{template_id}", response_model=PrintTemplateResponse)
-def update_print_template(template_id: str, payload: PrintTemplatePayload) -> PrintTemplateResponse:
+def update_print_template(template_id: str, payload: PrintTemplatePayload, user: AppUser = Depends(require_user)) -> PrintTemplateResponse:
     name, settings = normalize_print_template(payload)
     with SessionLocal.begin() as session:
         template = session.get(PrintTemplate, template_id)
-        if template is None:
+        if template is None or template.user_id != user.id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这个打印模板。")
         template.name = name
         template.settings = settings
@@ -887,21 +1333,19 @@ def update_print_template(template_id: str, payload: PrintTemplatePayload) -> Pr
 
 
 @app.delete("/api/print/templates/{template_id}")
-def delete_print_template(template_id: str) -> dict[str, str]:
+def delete_print_template(template_id: str, user: AppUser = Depends(require_user)) -> dict[str, str]:
     with SessionLocal.begin() as session:
         template = session.get(PrintTemplate, template_id)
-        if template is None:
+        if template is None or template.user_id != user.id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这个打印模板。")
         session.delete(template)
     return {"status": "deleted"}
 
 
 @app.get("/api/mistakes/{batch_id}", response_model=MistakeBatchDetailResponse)
-def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
+def get_mistake_batch(batch_id: str, user: AppUser = Depends(require_user)) -> MistakeBatchDetailResponse:
     with SessionLocal() as session:
-        batch = session.get(UploadBatch, batch_id)
-        if batch is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这组错题。")
+        batch = get_owned_batch(session, batch_id, user.id)
         files = list(batch.files)
         ocr = to_ocr_response(session.get(OcrRun, batch_id))
         questions = sorted(list(batch.questions), key=lambda question: question.position)
@@ -930,8 +1374,9 @@ def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
 
 
 @app.get("/api/mistakes/{batch_id}/files/{file_id}")
-def get_uploaded_file(batch_id: str, file_id: str) -> FileResponse:
+def get_uploaded_file(batch_id: str, file_id: str, user: AppUser = Depends(require_user)) -> FileResponse:
     with SessionLocal() as session:
+        get_owned_batch(session, batch_id, user.id)
         file = session.get(UploadedFile, file_id)
         if file is None or file.batch_id != batch_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到原始文件。")
@@ -943,11 +1388,9 @@ def get_uploaded_file(batch_id: str, file_id: str) -> FileResponse:
 
 
 @app.post("/api/mistakes/{batch_id}/ocr", response_model=OcrRunResponse, status_code=status.HTTP_202_ACCEPTED)
-def request_ocr(batch_id: str, background_tasks: BackgroundTasks, replace_question: bool = False) -> OcrRunResponse:
+def request_ocr(batch_id: str, background_tasks: BackgroundTasks, replace_question: bool = False, user: AppUser = Depends(require_user)) -> OcrRunResponse:
     with SessionLocal.begin() as session:
-        batch = session.get(UploadBatch, batch_id)
-        if batch is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这组错题。")
+        batch = get_owned_batch(session, batch_id, user.id)
         run = session.get(OcrRun, batch_id)
         if run is None:
             run = OcrRun(batch_id=batch_id)
@@ -964,8 +1407,42 @@ def request_ocr(batch_id: str, background_tasks: BackgroundTasks, replace_questi
     return to_ocr_response(run)
 
 
+@app.post("/api/mistakes/{batch_id}/ai-ocr", response_model=OcrRunResponse, status_code=status.HTTP_202_ACCEPTED)
+def request_ai_ocr(batch_id: str, background_tasks: BackgroundTasks, user: AppUser = Depends(require_user)) -> OcrRunResponse:
+    with SessionLocal.begin() as session:
+        get_owned_batch(session, batch_id, user.id)
+        run = session.get(OcrRun, batch_id)
+        if run is None or run.status != "completed" or not run.text.strip():
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先完成本地 OCR 识别。")
+        config = session.get(AiProviderConfig, user.id)
+        if config is None or not config.model or not config.encrypted_api_key:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中填写接口地址、模型和 API 密钥。")
+        if run.ai_status in {"queued", "running"}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="AI 正在复核，请稍后。")
+        run.ai_status = "queued"
+        run.ai_text = ""
+        run.ai_error_message = ""
+        run.ai_model = config.model
+        run.ai_started_at = None
+        run.ai_completed_at = None
+    background_tasks.add_task(run_ai_ocr_assist, batch_id, user.id)
+    return to_ocr_response(run)
+
+
+@app.post("/api/mistakes/{batch_id}/ai-ocr/apply", response_model=MistakeBatchDetailResponse)
+def apply_ai_ocr(batch_id: str, user: AppUser = Depends(require_user)) -> MistakeBatchDetailResponse:
+    with SessionLocal.begin() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        run = session.get(OcrRun, batch_id)
+        if run is None or run.ai_status != "completed" or not run.ai_text.strip():
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="还没有可采用的 AI 复核结果。")
+        create_question_draft_if_missing(session, batch_id, run.ai_text, force_replace=True)
+        batch.status = "review_ready"
+    return get_mistake_batch(batch_id, user)
+
+
 @app.put("/api/mistakes/{batch_id}/questions/{question_id}", response_model=MistakeQuestionResponse)
-def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUpdateRequest) -> MistakeQuestionResponse:
+def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUpdateRequest, user: AppUser = Depends(require_user)) -> MistakeQuestionResponse:
     if payload.question_type not in {"单选题", "多选题", "判断题", "填空题", "计算题", "证明题", "综合题", "简答题", "其他"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="题型不正确。")
     if payload.status not in {"draft", "confirmed"}:
@@ -986,6 +1463,7 @@ def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUp
         normalized_options.append({"label": label, "text": text})
 
     with SessionLocal.begin() as session:
+        get_owned_batch(session, batch_id, user.id)
         question = session.get(MistakeQuestion, question_id)
         if question is None or question.batch_id != batch_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
@@ -1016,8 +1494,9 @@ def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUp
 
 
 @app.post("/api/mistakes/{batch_id}/questions/{question_id}/structure-suggestion", response_model=StructureSuggestionResponse)
-def suggest_question_structure(batch_id: str, question_id: str, payload: StructureSuggestionRequest) -> StructureSuggestionResponse:
+def suggest_question_structure(batch_id: str, question_id: str, payload: StructureSuggestionRequest, user: AppUser = Depends(require_user)) -> StructureSuggestionResponse:
     with SessionLocal() as session:
+        get_owned_batch(session, batch_id, user.id)
         question = session.get(MistakeQuestion, question_id)
         if question is None or question.batch_id != batch_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
@@ -1032,6 +1511,7 @@ def suggest_question_structure(batch_id: str, question_id: str, payload: Structu
 @app.post("/api/uploads", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
 async def create_upload(
     background_tasks: BackgroundTasks,
+    user: AppUser = Depends(require_user),
     subject: str = Form(..., min_length=1, max_length=32),
     source: str = Form(..., min_length=1, max_length=32),
     note: str = Form("", max_length=2000),
@@ -1092,6 +1572,7 @@ async def create_upload(
         with SessionLocal.begin() as session:
             batch = UploadBatch(
                 id=batch_id,
+                owner_id=user.id,
                 subject=subject.strip(),
                 source=source.strip(),
                 note=note.strip(),

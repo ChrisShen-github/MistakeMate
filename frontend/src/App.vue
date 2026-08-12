@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   Bell,
   BookOpenCheck,
@@ -10,6 +10,7 @@ import {
   FolderOpen,
   GraduationCap,
   LayoutDashboard,
+  LoaderCircle,
   Menu,
   MoreHorizontal,
   Printer,
@@ -23,6 +24,8 @@ import UploadWorkspace from './components/UploadWorkspace.vue'
 import MistakeLibrary from './components/MistakeLibrary.vue'
 import BatchReview from './components/BatchReview.vue'
 import PrintWorkspace from './components/PrintWorkspace.vue'
+import AuthWorkspace, { type SignedInUser } from './components/AuthWorkspace.vue'
+import SettingsWorkspace from './components/SettingsWorkspace.vue'
 
 type NavItem = {
   label: string
@@ -37,13 +40,17 @@ const navigation: NavItem[] = [
 ]
 
 const activeNav = ref('今日任务')
-const currentView = ref<'dashboard' | 'upload' | 'library' | 'review' | 'print'>('dashboard')
+type AppView = 'dashboard' | 'upload' | 'library' | 'review' | 'print' | 'settings'
+const currentView = ref<AppView>('dashboard')
+const settingsReturnView = ref<AppView>('dashboard')
 const previousView = ref<'dashboard' | 'library'>('dashboard')
 const previousPrintView = ref<'dashboard' | 'library'>('dashboard')
 const activeBatchId = ref('')
 const sidebarOpen = ref(false)
 const notice = ref('')
 const isStartingReview = ref(false)
+const authLoading = ref(true)
+const currentUser = ref<SignedInUser | null>(null)
 
 const questions = [
   { subject: '数学', tag: '分数加减法', title: '计算：3/4 − 2/9 + 5/12', level: '高价值', stars: 2, due: '今天', color: 'blue' },
@@ -58,7 +65,8 @@ const subjects = [
 ]
 
 const activeTitle = computed(() => activeNav.value === '今日任务' ? '今天，先攻克最值得重做的题。' : activeNav.value)
-const currentCrumb = computed(() => currentView.value === 'upload' ? '上传错题' : currentView.value === 'library' ? '我的错题' : currentView.value === 'review' ? '检查错题' : currentView.value === 'print' ? '错题集打印' : activeNav.value)
+const currentCrumb = computed(() => currentView.value === 'upload' ? '上传错题' : currentView.value === 'library' ? '我的错题' : currentView.value === 'review' ? '检查错题' : currentView.value === 'print' ? '错题集打印' : currentView.value === 'settings' ? '账户与 AI 设置' : activeNav.value)
+const displayInitial = computed(() => currentUser.value?.display_name.slice(0, 1) || 'M')
 
 function showNotice(message: string) {
   notice.value = message
@@ -129,10 +137,42 @@ function onRecognitionQueued(count: number) {
   currentView.value = 'library'
   showNotice(`已上传 ${count} 个文件，下一步将进入题目检查。`)
 }
+
+function onAuthenticated(user: SignedInUser) {
+  currentUser.value = user
+  currentView.value = 'dashboard'
+}
+
+function openSettings() {
+  if (currentView.value !== 'settings') settingsReturnView.value = currentView.value
+  currentView.value = 'settings'
+  sidebarOpen.value = false
+}
+
+function closeSettings() {
+  currentView.value = settingsReturnView.value === 'settings' ? 'dashboard' : settingsReturnView.value
+}
+
+async function logout() {
+  await fetch('/api/auth/logout', { method: 'POST' }).catch(() => undefined)
+  currentUser.value = null
+  currentView.value = 'dashboard'
+}
+
+onMounted(async () => {
+  try {
+    const response = await fetch('/api/auth/me')
+    if (response.ok) currentUser.value = await response.json()
+  } finally {
+    authLoading.value = false
+  }
+})
 </script>
 
 <template>
-  <div class="app-shell">
+  <main v-if="authLoading" class="auth-check" aria-live="polite"><LoaderCircle :size="23" />正在打开 MistakeMate…</main>
+  <AuthWorkspace v-else-if="!currentUser" @authenticated="onAuthenticated" />
+  <div v-else class="app-shell">
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <aside class="sidebar" :class="{ 'is-open': sidebarOpen }" aria-label="主导航">
       <div class="brand-row">
@@ -163,8 +203,8 @@ function onRecognitionQueued(count: number) {
       <div class="sidebar-bottom">
         <button class="nav-item muted" @click="showNotice('帮助中心将在正式版开放。')"><CircleHelp :size="19" />使用帮助</button>
         <div class="child-switcher">
-          <div class="avatar">晨</div>
-          <div><strong>陈晨</strong><span>小学五年级</span></div>
+          <div class="avatar">{{ displayInitial }}</div>
+          <div><strong>{{ currentUser.display_name }}</strong><span>@{{ currentUser.username }}</span></div>
           <MoreHorizontal :size="18" />
         </div>
       </div>
@@ -175,17 +215,18 @@ function onRecognitionQueued(count: number) {
     <main id="main-content" class="main-content" tabindex="-1">
       <header class="topbar">
         <button class="mobile-menu icon-button" aria-label="打开导航" @click="sidebarOpen = true"><Menu :size="21" /></button>
-        <div class="crumb"><span>陈晨的错题本</span><ChevronRight :size="15" /><strong>{{ currentCrumb }}</strong></div>
+        <div class="crumb"><span>{{ currentUser.display_name }}的错题本</span><ChevronRight :size="15" /><strong>{{ currentCrumb }}</strong></div>
         <div class="top-actions">
           <button class="bell icon-button" aria-label="查看提醒" @click="showNotice('今天有 8 道题等待复练。')"><Bell :size="20" /><i></i></button>
-          <button class="profile" @click="showNotice('孩子档案设置将在后续开放。')"><div class="avatar">晨</div><span>陈晨</span></button>
+          <button class="profile" aria-label="打开账户与 AI 设置" @click="openSettings"><div class="avatar">{{ displayInitial }}</div><span>{{ currentUser.display_name }}</span></button>
         </div>
       </header>
 
       <UploadWorkspace v-if="currentView === 'upload'" @back="closeUpload" @queued="onRecognitionQueued" />
       <MistakeLibrary v-else-if="currentView === 'library'" @upload="openUpload" @print="openPrint" @open="openBatch($event.id)" />
-      <BatchReview v-else-if="currentView === 'review'" :batch-id="activeBatchId" @back="openLibrary" />
+      <BatchReview v-else-if="currentView === 'review'" :batch-id="activeBatchId" @back="openLibrary" @configure-ai="openSettings" />
       <PrintWorkspace v-else-if="currentView === 'print'" @back="closePrint" />
+      <SettingsWorkspace v-else-if="currentView === 'settings'" :user="currentUser" @back="closeSettings" @logout="logout" />
 
       <section v-else class="dashboard">
         <div class="welcome-row">

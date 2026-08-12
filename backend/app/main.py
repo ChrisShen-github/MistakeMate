@@ -18,7 +18,7 @@ from uuid import uuid4
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
@@ -108,6 +108,27 @@ class MistakeQuestion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     batch: Mapped[UploadBatch] = relationship(back_populates="questions")
+    parts: Mapped[list["QuestionPart"]] = relationship(back_populates="question", cascade="all, delete-orphan")
+
+
+class QuestionPart(Base):
+    __tablename__ = "question_parts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    question_id: Mapped[str] = mapped_column(ForeignKey("mistake_questions.id"), index=True)
+    parent_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    position: Mapped[int] = mapped_column(Integer, default=1)
+    label: Mapped[str] = mapped_column(String(32), default="")
+    part_type: Mapped[str] = mapped_column(String(32), default="计算题")
+    prompt: Mapped[str] = mapped_column(Text, default="")
+    answers: Mapped[str] = mapped_column(Text, default="[]")
+    solution: Mapped[str] = mapped_column(Text, default="")
+    key_points: Mapped[str] = mapped_column(Text, default="[]")
+    answer_lines: Mapped[int] = mapped_column(Integer, default=3)
+    knowledge_points: Mapped[str] = mapped_column(Text, default="")
+    difficulty: Mapped[int] = mapped_column(Integer, default=3)
+    error_type: Mapped[str] = mapped_column(String(32), default="")
+    question: Mapped[MistakeQuestion] = relationship(back_populates="parts")
 
 
 class UploadResponse(BaseModel):
@@ -147,6 +168,22 @@ class QuestionOption(BaseModel):
     text: str
 
 
+class QuestionPartPayload(BaseModel):
+    id: str = ""
+    parent_id: str | None = None
+    position: int = 1
+    label: str = ""
+    part_type: str = "计算题"
+    prompt: str = ""
+    answers: list[str] = Field(default_factory=list)
+    solution: str = ""
+    key_points: list[str] = Field(default_factory=list)
+    answer_lines: int = 3
+    knowledge_points: str = ""
+    difficulty: int = 3
+    error_type: str = ""
+
+
 class MistakeQuestionResponse(BaseModel):
     id: str
     position: int
@@ -158,6 +195,7 @@ class MistakeQuestionResponse(BaseModel):
     knowledge_points: str
     difficulty: int
     error_type: str
+    parts: list[QuestionPartPayload]
     status: str
     updated_at: datetime
 
@@ -171,7 +209,17 @@ class QuestionUpdateRequest(BaseModel):
     knowledge_points: str = ""
     difficulty: int = 3
     error_type: str = ""
+    parts: list[QuestionPartPayload] = Field(default_factory=list)
     status: str = "draft"
+
+
+class StructureSuggestionRequest(BaseModel):
+    stem: str
+
+
+class StructureSuggestionResponse(BaseModel):
+    stem: str
+    parts: list[QuestionPartPayload]
 
 
 class MistakeBatchDetailResponse(MistakeBatchResponse):
@@ -183,6 +231,9 @@ class MistakeBatchDetailResponse(MistakeBatchResponse):
 ocr_model: Any | None = None
 ocr_model_lock = Lock()
 OPTION_LABEL_PATTERN = re.compile(r"^([A-H])(?:[.、．:：]\s*|\s+|$)(.*)$")
+TOP_PART_PATTERN = re.compile(r"(?m)^\s*[（(](\d{1,2})[）)]\s*")
+CIRCLED_PART_PATTERN = re.compile(r"(?m)^\s*([①②③④⑤⑥⑦⑧⑨⑩])\s*")
+QUESTION_PART_TYPES = {"题组说明", "填空题", "计算题", "证明题", "简答题", "选择题", "判断题", "其他"}
 
 
 def to_ocr_response(run: OcrRun | None) -> OcrRunResponse | None:
@@ -195,6 +246,32 @@ def to_ocr_response(run: OcrRun | None) -> OcrRunResponse | None:
         error_message=run.error_message,
         started_at=run.started_at,
         completed_at=run.completed_at,
+    )
+
+
+def parse_string_list(value: str) -> list[str]:
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
+
+
+def to_question_part_payload(part: QuestionPart) -> QuestionPartPayload:
+    return QuestionPartPayload(
+        id=part.id,
+        parent_id=part.parent_id,
+        position=part.position,
+        label=part.label,
+        part_type=part.part_type,
+        prompt=part.prompt,
+        answers=parse_string_list(part.answers),
+        solution=part.solution,
+        key_points=parse_string_list(part.key_points),
+        answer_lines=part.answer_lines,
+        knowledge_points=part.knowledge_points,
+        difficulty=part.difficulty,
+        error_type=part.error_type,
     )
 
 
@@ -215,9 +292,168 @@ def to_question_response(question: MistakeQuestion) -> MistakeQuestionResponse:
         knowledge_points=question.knowledge_points,
         difficulty=question.difficulty,
         error_type=question.error_type,
+        parts=[to_question_part_payload(part) for part in sorted(question.parts, key=lambda item: item.position)],
         status=question.status,
         updated_at=question.updated_at,
     )
+
+
+def infer_part_type(prompt: str) -> str:
+    if re.search(r"_{2,}|（\s*）|\(\s*\)|填空", prompt):
+        return "填空题"
+    if "证明" in prompt or ("说明" in prompt and "正确" in prompt):
+        return "证明题"
+    if any(marker in prompt for marker in ("计算", "求出", "求值", "解方程", "定值")):
+        return "计算题"
+    if "选择" in prompt:
+        return "选择题"
+    if "判断" in prompt:
+        return "判断题"
+    return "简答题"
+
+
+def suggested_answer_count(prompt: str, part_type: str) -> int:
+    if part_type != "填空题":
+        return 1
+    blanks = re.findall(r"_{2,}|（\s*）|\(\s*\)", prompt)
+    return max(1, min(len(blanks), 12))
+
+
+def suggested_answer_lines(part_type: str) -> int:
+    return {"填空题": 1, "选择题": 1, "判断题": 1, "计算题": 4, "证明题": 6, "简答题": 4}.get(part_type, 3)
+
+
+def build_structure_suggestion(stem: str) -> StructureSuggestionResponse:
+    top_matches = list(TOP_PART_PATTERN.finditer(stem))
+    if not top_matches:
+        return StructureSuggestionResponse(stem=stem, parts=[])
+
+    common_stem = stem[: top_matches[0].start()].strip()
+    parts: list[QuestionPartPayload] = []
+    position = 1
+    for index, match in enumerate(top_matches):
+        segment_end = top_matches[index + 1].start() if index + 1 < len(top_matches) else len(stem)
+        segment = stem[match.end() : segment_end].strip()
+        top_label = f"({match.group(1)})"
+        child_matches = list(CIRCLED_PART_PATTERN.finditer(segment))
+        if child_matches:
+            group_id = str(uuid4())
+            group_prompt = segment[: child_matches[0].start()].strip()
+            parts.append(
+                QuestionPartPayload(
+                    id=group_id,
+                    position=position,
+                    label=top_label,
+                    part_type="题组说明",
+                    prompt=group_prompt,
+                    answers=[],
+                    answer_lines=0,
+                )
+            )
+            position += 1
+            for child_index, child_match in enumerate(child_matches):
+                child_end = child_matches[child_index + 1].start() if child_index + 1 < len(child_matches) else len(segment)
+                child_prompt = segment[child_match.end() : child_end].strip()
+                part_type = infer_part_type(child_prompt)
+                parts.append(
+                    QuestionPartPayload(
+                        id=str(uuid4()),
+                        parent_id=group_id,
+                        position=position,
+                        label=child_match.group(1),
+                        part_type=part_type,
+                        prompt=child_prompt,
+                        answers=[""] * suggested_answer_count(child_prompt, part_type),
+                        answer_lines=suggested_answer_lines(part_type),
+                    )
+                )
+                position += 1
+        else:
+            part_type = infer_part_type(segment)
+            parts.append(
+                QuestionPartPayload(
+                    id=str(uuid4()),
+                    position=position,
+                    label=top_label,
+                    part_type=part_type,
+                    prompt=segment,
+                    answers=[""] * suggested_answer_count(segment, part_type),
+                    answer_lines=suggested_answer_lines(part_type),
+                )
+            )
+            position += 1
+
+    return StructureSuggestionResponse(stem=common_stem or stem, parts=parts)
+
+
+def save_question_parts(session: Any, question: MistakeQuestion, payloads: list[QuestionPartPayload], confirming: bool) -> None:
+    if len(payloads) > 30:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="一道题最多添加 30 个小问或分组。")
+
+    existing_by_id = {part.id: part for part in question.parts}
+    payload_ids: set[str] = set()
+    id_mapping: dict[str, str] = {}
+    seen_ids: set[str] = set()
+    seen_types: dict[str, str] = {}
+
+    for index, payload in enumerate(payloads):
+        payload_id = payload.id.strip()
+        if not payload_id or payload_id in payload_ids:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="小问编号数据无效，请重新拆分后再保存。")
+        payload_ids.add(payload_id)
+        id_mapping[payload_id] = payload_id if payload_id in existing_by_id else str(uuid4())
+
+        if payload.part_type not in QUESTION_PART_TYPES:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{payload.label or '小问'}的题型不正确。")
+        if payload.parent_id is not None and payload.parent_id not in seen_ids:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{payload.label or '小问'}的上级分组不正确。")
+        if payload.parent_id is not None and seen_types.get(payload.parent_id) != "题组说明":
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{payload.label or '小问'}只能放在题组说明下面。")
+        if payload.parent_id is not None and payload.part_type == "题组说明":
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="暂不支持三层以上的小问结构。")
+        if not payload.label.strip():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请填写每个小问的编号。")
+        if not payload.prompt.strip():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"请填写小问 {payload.label} 的内容。")
+        if not 1 <= payload.difficulty <= 5:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"小问 {payload.label} 的难度应在 1 到 5 星之间。")
+        if payload.part_type != "题组说明" and not 1 <= payload.answer_lines <= 12:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"小问 {payload.label} 的答题空间应为 1 到 12 行。")
+        if len(payload.answers) > 12 or len(payload.key_points) > 12:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"小问 {payload.label} 的答案或关键步骤过多。")
+
+        answers = [answer.strip()[:1000] for answer in payload.answers]
+        solution = payload.solution.strip()[:12000]
+        if confirming and payload.part_type != "题组说明":
+            if payload.part_type == "填空题" and (not answers or any(not answer for answer in answers)):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"请补全小问 {payload.label} 的所有填空答案。")
+            if payload.part_type != "填空题" and not any(answers) and not solution:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"请填写小问 {payload.label} 的答案或解题过程。")
+
+        part_id = id_mapping[payload_id]
+        part = existing_by_id.get(part_id)
+        if part is None:
+            part = QuestionPart(id=part_id, question_id=question.id)
+            session.add(part)
+        part.parent_id = id_mapping.get(payload.parent_id) if payload.parent_id else None
+        part.position = index + 1
+        part.label = payload.label.strip()[:32]
+        part.part_type = payload.part_type
+        part.prompt = payload.prompt.strip()[:12000]
+        part.answers = json.dumps(answers, ensure_ascii=False)
+        part.solution = solution
+        part.key_points = json.dumps([point.strip()[:1000] for point in payload.key_points if point.strip()], ensure_ascii=False)
+        part.answer_lines = 0 if payload.part_type == "题组说明" else payload.answer_lines
+        part.knowledge_points = payload.knowledge_points.strip()[:1000]
+        part.difficulty = payload.difficulty
+        part.error_type = payload.error_type.strip()[:32]
+        seen_ids.add(payload_id)
+        seen_types[payload_id] = payload.part_type
+
+    kept_ids = set(id_mapping.values())
+    for part_id, part in existing_by_id.items():
+        if part_id not in kept_ids:
+            session.delete(part)
 
 
 def first_non_empty(lines: list[str], start: int, limit: int = 8) -> str:
@@ -541,6 +777,7 @@ def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
         files = list(batch.files)
         ocr = to_ocr_response(session.get(OcrRun, batch_id))
         questions = sorted(list(batch.questions), key=lambda question: question.position)
+        question_responses = [to_question_response(question) for question in questions]
 
     return MistakeBatchDetailResponse(
         id=batch.id,
@@ -560,7 +797,7 @@ def get_mistake_batch(batch_id: str) -> MistakeBatchDetailResponse:
             for file in files
         ],
         ocr=ocr,
-        questions=[to_question_response(question) for question in questions],
+        questions=question_responses,
     )
 
 
@@ -601,7 +838,7 @@ def request_ocr(batch_id: str, background_tasks: BackgroundTasks) -> OcrRunRespo
 
 @app.put("/api/mistakes/{batch_id}/questions/{question_id}", response_model=MistakeQuestionResponse)
 def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUpdateRequest) -> MistakeQuestionResponse:
-    if payload.question_type not in {"单选题", "多选题", "判断题", "填空题", "计算题", "简答题", "其他"}:
+    if payload.question_type not in {"单选题", "多选题", "判断题", "填空题", "计算题", "证明题", "综合题", "简答题", "其他"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="题型不正确。")
     if payload.status not in {"draft", "confirmed"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="确认状态不正确。")
@@ -632,13 +869,32 @@ def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUp
         question.knowledge_points = payload.knowledge_points.strip()[:1000]
         question.difficulty = payload.difficulty
         question.error_type = payload.error_type.strip()[:32]
+        save_question_parts(session, question, payload.parts, payload.status == "confirmed")
         question.status = payload.status
         question.updated_at = datetime.now(timezone.utc)
         batch = session.get(UploadBatch, batch_id)
         if batch is not None:
             batch.status = "confirmed" if payload.status == "confirmed" else "review_ready"
 
-    return to_question_response(question)
+    with SessionLocal() as session:
+        saved_question = session.get(MistakeQuestion, question_id)
+        if saved_question is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+        return to_question_response(saved_question)
+
+
+@app.post("/api/mistakes/{batch_id}/questions/{question_id}/structure-suggestion", response_model=StructureSuggestionResponse)
+def suggest_question_structure(batch_id: str, question_id: str, payload: StructureSuggestionRequest) -> StructureSuggestionResponse:
+    with SessionLocal() as session:
+        question = session.get(MistakeQuestion, question_id)
+        if question is None or question.batch_id != batch_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+    if not payload.stem.strip():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请先补充题干，再识别小问。")
+    suggestion = build_structure_suggestion(payload.stem.strip()[:12000])
+    if not suggestion.parts:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="没有识别到 (1)、(2) 等小问编号，可以手动添加小问。")
+    return suggestion
 
 
 @app.post("/api/uploads", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)

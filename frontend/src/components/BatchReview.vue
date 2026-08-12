@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ArrowLeft, CircleAlert, FileImage, FileText, ImageOff, Info, LoaderCircle, RefreshCw, ScanText } from '@lucide/vue'
-import QuestionEditor, { type MistakeQuestion } from './QuestionEditor.vue'
+import QuestionEditor from './QuestionEditor.vue'
+import type { MistakeQuestion } from '../types/questions'
 
 type UploadedFile = { id: string; original_name: string; content_type: string; size: number }
 type OcrRun = { engine: string; status: string; text: string; error_message: string; started_at: string | null; completed_at: string | null }

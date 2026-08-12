@@ -18,3 +18,11 @@
 - Difficulty uses five labelled, keyboard-focusable star buttons; the selected value is not communicated by colour alone.
 - Primary confirmation and secondary draft-save controls are at least 44px high and remain easy to reach on a phone.
 - Preserve the original uploaded image as the source of truth and clearly tell the user to compare it before confirming.
+
+### Multi-part Question Editor
+
+- Keep the common stem once, then show root parts and indented child parts in reading order.
+- Use progressive disclosure: final answers stay visible; scoring points, answer space, per-part difficulty, knowledge points, and error type live behind an expandable section.
+- Fill-in questions use one labelled answer input per blank. Calculation and proof questions separate the final answer from the full solution.
+- Automatic structure detection changes only the current draft until the user explicitly saves it.
+- Preserve the simple single-answer form when no numbered parts are detected.

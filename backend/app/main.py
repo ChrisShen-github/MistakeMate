@@ -270,7 +270,7 @@ class LoginRequest(BaseModel):
 
 class AiConfigUpdateRequest(BaseModel):
     base_url: str = Field(min_length=8, max_length=512)
-    model: str = Field(min_length=1, max_length=128)
+    model: str = Field(min_length=1, max_length=256)
     api_key: str = Field(default="", max_length=512)
     clear_api_key: bool = False
 
@@ -285,6 +285,15 @@ class AiConfigResponse(BaseModel):
 class AiConnectionResponse(BaseModel):
     status: str
     message: str
+
+
+class AiModelListRequest(BaseModel):
+    base_url: str = Field(min_length=8, max_length=512)
+    api_key: str = Field(default="", max_length=512)
+
+
+class AiModelListResponse(BaseModel):
+    models: list[str]
 
 
 class QuestionOption(BaseModel):
@@ -531,6 +540,29 @@ def normalize_ai_base_url(value: str) -> str:
     if not re.match(r"^https?://", base_url):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="接口地址需以 http:// 或 https:// 开头。")
     return base_url
+
+
+def fetch_ai_models(base_url: str, api_key: str) -> list[str]:
+    if not api_key:
+        raise RuntimeError("请先输入 API 密钥，或先保存已有密钥。")
+    request = UrlRequest(
+        f"{base_url.rstrip('/')}/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"读取模型列表失败（{error.code}）：{detail or '请检查接口地址和密钥。'}") from error
+    except (URLError, TimeoutError) as error:
+        raise RuntimeError(f"无法连接 AI 服务：{error}") from error
+    items = payload.get("data", []) if isinstance(payload, dict) else []
+    models = sorted({str(item.get("id", "")).strip() for item in items if isinstance(item, dict) and item.get("id")})
+    if not models:
+        raise RuntimeError("服务没有返回可选模型。请检查接口是否兼容 OpenAI 的 /models 接口，或改用手动填写模型 ID。")
+    return models
 
 
 def parse_string_list(value: str) -> list[str]:
@@ -1286,6 +1318,21 @@ def save_ai_config(payload: AiConfigUpdateRequest, user: AppUser = Depends(requi
         api_key_configured=bool(config.encrypted_api_key),
         updated_at=config.updated_at,
     )
+
+
+@app.post("/api/settings/ai/models", response_model=AiModelListResponse)
+def list_ai_models(payload: AiModelListRequest, user: AppUser = Depends(require_user)) -> AiModelListResponse:
+    base_url = normalize_ai_base_url(payload.base_url)
+    api_key = payload.api_key.strip()
+    if not api_key:
+        with SessionLocal() as session:
+            config = session.get(AiProviderConfig, user.id)
+            if config is not None and config.encrypted_api_key:
+                api_key = decrypt_api_key(config.encrypted_api_key)
+    try:
+        return AiModelListResponse(models=fetch_ai_models(base_url, api_key))
+    except RuntimeError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
 
 
 @app.post("/api/settings/ai/test", response_model=AiConnectionResponse)

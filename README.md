@@ -2,21 +2,20 @@
 
 MistakeMate 是一个面向家长与孩子的错题整理、复练和打印工具。
 
-## 本地启动
+## Docker 部署
 
-复制环境变量示例并设置 PostgreSQL 密码：
-
-```powershell
-Copy-Item .env.example .env
-```
-
-随后启动：
+下载本仓库中的 `docker-compose.yml` 后，在该文件所在目录执行：
 
 ```powershell
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 打开 `http://localhost:8080`。
+
+Compose 会直接拉取 `akwangdao/mistakemate:latest`，不需要本机构建镜像。PostgreSQL 没有暴露电脑端口，`5432` 仅供两个容器在 Docker 内部通信，因此不会和电脑已经安装的 PostgreSQL 冲突。若电脑的 `8080` 已被占用，把 `"8080:8080"` 改为例如 `"18080:8080"`，然后访问 `http://localhost:18080`。
+
+原图和上传文件存放于同目录的 `data/`，OCR 模型放在 `models/`，数据库放在 `postgres-data/`；它们都是宿主机目录，重建容器或更新镜像不会丢失。未使用 `container_name`，可避免与电脑上已有 Docker 容器重名。
 
 首次打开会创建 MistakeMate 账号。登录后可在侧栏分别打开“账户设置”“AI 设置”和“OCR 模型”。AI 设置中填写 OpenAI 兼容接口地址、视觉模型和 API 密钥；密钥会在服务端加密保存，不会回显到网页。认证签名和密钥加密所需的内部密钥会在首次启动时自动生成并保存在 PostgreSQL，不需要额外填写环境变量。
 
@@ -27,7 +26,7 @@ docker compose up -d --build
 - PaddleOCR 运行依赖会随镜像安装，但模型权重不会放进镜像；首次使用请先在侧栏“OCR 模型”页手动下载。页面会显示逐模型进度、实时速度、失败原因，并支持取消后断点续传。
 - 模型从 PaddleOCR 官方百度 BOS（国内源）下载，通常不需要代理；实际速度取决于部署机器网络。模型下载完成后可离线识别。
 - JPG、PNG 和 WebP 图片可在上传前手动截取识别范围；系统只裁剪临时 OCR 输入，完整原图仍会保留。
-- 模型保存在项目的 `models/` 目录，原图保存在 `storage/`，数据库保存在 `postgres-data/`。这三个运行目录都不会提交到 Git。
+- 模型保存在项目的 `models/` 目录，原图保存在 `data/`，数据库保存在 `postgres-data/`。这三个运行目录都不会提交到 Git。
 - CPU 识别时应用容器通常需要约 1 GB 内存。手写、公式和图形题仍应结合原图人工核对；当前 OCR 文本是可继续编辑和拆题的初稿。
 - 识别完成后会自动生成一张可编辑的题目初稿。请核对题干、选项和答案，再补充知识点、难度与错因；确认后才进入后续错题集和复练安排。
 - 多问计算题或综合题可识别 `(1)`、`(2)`、`①`、`②` 等结构：公共题干只保存一次；答案、解析和关键得分点均为可选，不填写答案也能确认完整题目，为后续练习版打印保留每个小问的答题空间。

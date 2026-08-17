@@ -1466,6 +1466,16 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             time.sleep(1)
     with SessionLocal.begin() as session:
         ensure_security_row(session)
+        interrupted_runs = session.execute(
+            select(OcrRun).where(OcrRun.status.in_(("queued", "running")))
+        ).scalars().all()
+        for run in interrupted_runs:
+            run.status = "failed"
+            run.error_message = "服务在识别过程中重启，请点击“重试”重新识别。"
+            run.completed_at = datetime.now(timezone.utc)
+            batch = session.get(UploadBatch, run.batch_id)
+            if batch is not None and batch.status in {"queued", "recognizing"}:
+                batch.status = "ocr_failed"
         completed_runs = session.execute(select(OcrRun).where(OcrRun.status == "completed")).scalars().all()
         for run in completed_runs:
             create_question_draft_if_missing(session, run.batch_id, run.text)

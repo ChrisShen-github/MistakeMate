@@ -83,7 +83,7 @@ onMounted(loadConfig)
 <template>
   <section class="ai-settings-page" aria-labelledby="ai-settings-title">
     <button class="back-button" type="button" @click="emit('back')"><ArrowLeft :size="18" />返回</button>
-    <header class="page-heading"><p>识别增强</p><h1 id="ai-settings-title">AI 设置</h1><span>连接兼容 OpenAI 的视觉模型，用于你主动发起的题目复核。</span></header>
+    <header class="page-heading"><p>识别增强</p><h1 id="ai-settings-title">AI 设置</h1><span>连接兼容 OpenAI 的视觉模型，用于上传时直接识别和后续题目复核。</span></header>
     <div v-if="isLoading" class="loading" aria-live="polite"><LoaderCircle class="spin" :size="20" />正在读取 AI 设置…</div>
     <form v-else class="ai-card" @submit.prevent="saveConfig">
       <div class="card-heading"><div class="icon"><Sparkles :size="20" /></div><div><h2>连接你的 AI 服务</h2><span>输入地址和密钥后，MistakeMate 会读取该服务的模型列表，供你直接选择。</span></div></div>
@@ -94,7 +94,7 @@ onMounted(loadConfig)
       </div>
 
       <section class="model-section" aria-labelledby="model-heading"><div class="section-top"><div><h3 id="model-heading">视觉模型</h3><p>不确定填什么？先加载模型，再从列表中选择。</p></div><button class="secondary load-button" type="button" :disabled="!canLoadModels || isLoadingModels" @click="loadModels"><LoaderCircle v-if="isLoadingModels" class="spin" :size="17" /><RefreshCw v-else :size="17" />{{ isLoadingModels ? '正在加载…' : availableModels.length ? '重新加载模型' : '加载可用模型' }}</button></div>
-        <label v-if="availableModels.length && !useManualModel" for="ai-model">选择模型<select id="ai-model" v-model="model" required><option value="" disabled>请选择用于 OCR 复核的视觉模型</option><option v-for="item in availableModels" :key="item" :value="item">{{ item }}</option></select><ChevronDown class="select-icon" :size="18" /></label>
+        <label v-if="availableModels.length && !useManualModel" for="ai-model">选择模型<select id="ai-model" v-model="model" required><option value="" disabled>请选择支持图片输入的视觉模型</option><option v-for="item in availableModels" :key="item" :value="item">{{ item }}</option></select><ChevronDown class="select-icon" :size="18" /></label>
         <label v-else for="ai-model">模型 ID<input id="ai-model" v-model.trim="model" required placeholder="先加载模型；若服务不提供列表，也可手动填写" /><small>填写服务商文档中标注的模型 ID，例如 <code>gpt-4o</code>。请确认该模型支持图片输入。</small></label>
         <button class="text-button" type="button" @click="useManualModel = !useManualModel">{{ useManualModel ? '返回模型列表选择' : '列表没有需要的模型？手动填写模型 ID' }}</button>
       </section>

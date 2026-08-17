@@ -27,7 +27,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func, inspect, select, text, update
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, delete, func, inspect, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -1182,6 +1182,8 @@ def _run_ocr(batch_id: str, replace_question: bool = False) -> None:
         run = session.get(OcrRun, batch_id)
         if batch is None or run is None:
             return
+        if run.status == "cancelled":
+            return
         batch.status = "recognizing"
         run.status = "running"
         run.error_message = ""
@@ -1202,8 +1204,12 @@ def _run_ocr(batch_id: str, replace_question: bool = False) -> None:
         with tempfile.TemporaryDirectory(prefix="mistakemate-ocr-") as temporary_path:
             temporary_directory = Path(temporary_path)
             for _, original_name, stored_name, crop_region in files:
+                if is_ocr_cancelled(batch_id):
+                    return
                 source = storage_root / "uploads" / batch_id / stored_name
                 for input_path in prepare_ocr_inputs(source, original_name, temporary_directory, crop_region):
+                    if is_ocr_cancelled(batch_id):
+                        return
                     for result in model.predict(str(input_path)):
                         payload = result_to_dict(result)
                         results.append(payload)
@@ -1219,6 +1225,8 @@ def _run_ocr(batch_id: str, replace_question: bool = False) -> None:
             run = session.get(OcrRun, batch_id)
             if batch is None or run is None:
                 return
+            if run.status == "cancelled":
+                return
             batch.status = "review_ready"
             run.status = "completed"
             run.text = recognized_text
@@ -1231,10 +1239,18 @@ def _run_ocr(batch_id: str, replace_question: bool = False) -> None:
             run = session.get(OcrRun, batch_id)
             if batch is None or run is None:
                 return
+            if run.status == "cancelled":
+                return
             batch.status = "ocr_failed"
             run.status = "failed"
             run.error_message = str(error)[:2000]
             run.completed_at = datetime.now(timezone.utc)
+
+
+def is_ocr_cancelled(batch_id: str) -> bool:
+    with SessionLocal() as session:
+        run = session.get(OcrRun, batch_id)
+        return run is None or run.status == "cancelled"
 
 
 def split_upload_batch_by_file(batch_id: str, user_id: str) -> list[str]:
@@ -1355,16 +1371,25 @@ def call_ai_chat(config: AiProviderConfig, messages: list[dict[str, Any]], max_t
 
 
 def build_ai_ocr_messages(batch_id: str, local_ocr_text: str) -> list[dict[str, Any]]:
-    content: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": (
-                "请复核这些试题图片，并结合下面的本地 OCR 初稿，输出完整、可编辑的题面文字。"
-                "补全漏字，修正明显错字，保留题号、选项、小问、公式与换行。不要解题，不要添加答案，"
-                "不要解释；看不清的内容标记为［无法确认］。\n\n本地 OCR 初稿：\n" + local_ocr_text[:16000]
-            ),
-        }
-    ]
+    prompt = (
+        "请复核这些试题图片，并结合下面的本地 OCR 初稿，输出完整、可编辑的题面文字。"
+        "补全漏字，修正明显错字，保留题号、选项、小问、公式与换行。不要解题，不要添加答案，"
+        "不要解释；看不清的内容标记为［无法确认］。\n\n本地 OCR 初稿：\n" + local_ocr_text[:16000]
+    )
+    return build_ai_image_messages(batch_id, prompt)
+
+
+def build_direct_ai_ocr_messages(batch_id: str) -> list[dict[str, Any]]:
+    prompt = (
+        "请直接转写这些试题图片，输出完整、可编辑的题面文字。"
+        "保留题号、选项、小问、公式与换行。不要解题，不要添加答案，不要解释；"
+        "看不清的内容标记为［无法确认］。"
+    )
+    return build_ai_image_messages(batch_id, prompt)
+
+
+def build_ai_image_messages(batch_id: str, prompt: str) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     with SessionLocal() as session:
         batch = session.get(UploadBatch, batch_id)
         files = [] if batch is None else list(batch.files)
@@ -1434,6 +1459,48 @@ def run_ai_ocr_assist(batch_id: str, user_id: str) -> None:
             run.ai_status = "failed"
             run.ai_error_message = str(error)[:2000]
             run.ai_completed_at = datetime.now(timezone.utc)
+
+
+def run_direct_ai_ocr(batch_id: str, user_id: str) -> None:
+    with SessionLocal.begin() as session:
+        batch = session.get(UploadBatch, batch_id)
+        run = session.get(OcrRun, batch_id)
+        config = session.get(AiProviderConfig, user_id)
+        if batch is None or batch.owner_id != user_id or run is None or config is None:
+            return
+        if run.status == "cancelled":
+            return
+        batch.status = "recognizing"
+        run.status = "running"
+        run.engine = "AI 视觉识别"
+        run.error_message = ""
+        run.text = ""
+        run.raw_result = ""
+        run.started_at = datetime.now(timezone.utc)
+        run.completed_at = None
+        session.expunge(config)
+    try:
+        ai_text = call_ai_chat(config, build_direct_ai_ocr_messages(batch_id))
+        with SessionLocal.begin() as session:
+            batch = session.get(UploadBatch, batch_id)
+            run = session.get(OcrRun, batch_id)
+            if batch is None or run is None or run.status == "cancelled":
+                return
+            batch.status = "review_ready"
+            run.status = "completed"
+            run.text = ai_text
+            run.completed_at = datetime.now(timezone.utc)
+            create_question_draft_if_missing(session, batch_id, ai_text)
+    except Exception as error:
+        with SessionLocal.begin() as session:
+            batch = session.get(UploadBatch, batch_id)
+            run = session.get(OcrRun, batch_id)
+            if batch is None or run is None or run.status == "cancelled":
+                return
+            batch.status = "ocr_failed"
+            run.status = "failed"
+            run.error_message = str(error)[:2000]
+            run.completed_at = datetime.now(timezone.utc)
 
 
 def ensure_legacy_columns() -> None:
@@ -1866,6 +1933,37 @@ def request_ocr(batch_id: str, background_tasks: BackgroundTasks, replace_questi
     return to_ocr_response(run)
 
 
+@app.post("/api/mistakes/{batch_id}/ocr/cancel", response_model=OcrRunResponse)
+def cancel_ocr(batch_id: str, user: AppUser = Depends(require_user)) -> OcrRunResponse:
+    with SessionLocal.begin() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        run = session.get(OcrRun, batch_id)
+        if run is None or run.status not in {"queued", "running"}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="当前没有可取消的识别任务。")
+        batch.status = "ocr_cancelled"
+        run.status = "cancelled"
+        run.error_message = "识别已取消。"
+        run.completed_at = datetime.now(timezone.utc)
+    return to_ocr_response(run)
+
+
+@app.delete("/api/mistakes/{batch_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_mistake_batch(batch_id: str, user: AppUser = Depends(require_user)) -> Response:
+    batch_directory = storage_root / "uploads" / batch_id
+    with SessionLocal.begin() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        file_ids = [file.id for file in batch.files]
+        if file_ids:
+            session.execute(delete(OcrRegion).where(OcrRegion.file_id.in_(file_ids)))
+        run = session.get(OcrRun, batch_id)
+        if run is not None:
+            session.delete(run)
+        session.flush()
+        session.delete(batch)
+    shutil.rmtree(batch_directory, ignore_errors=True)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @app.post("/api/mistakes/{batch_id}/ai-ocr", response_model=OcrRunResponse, status_code=status.HTTP_202_ACCEPTED)
 def request_ai_ocr(batch_id: str, background_tasks: BackgroundTasks, user: AppUser = Depends(require_user)) -> OcrRunResponse:
     with SessionLocal.begin() as session:
@@ -1974,6 +2072,7 @@ async def create_upload(
     subject: str = Form(..., min_length=1, max_length=32),
     source: str = Form(..., min_length=1, max_length=32),
     note: str = Form("", max_length=2000),
+    recognition_mode: str = Form("local", max_length=16),
     crop_regions: str = Form("[]"),
     files: list[UploadFile] = File(...),
 ) -> UploadResponse:
@@ -1981,6 +2080,13 @@ async def create_upload(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请至少上传一个文件。")
     if len(files) > MAX_FILES_PER_BATCH:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"一次最多上传 {MAX_FILES_PER_BATCH} 个文件。")
+    if recognition_mode not in {"local", "ai"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="识别方式不正确。")
+    if recognition_mode == "ai":
+        with SessionLocal() as session:
+            config = session.get(AiProviderConfig, user.id)
+            if config is None or not config.model or not config.encrypted_api_key:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中填写接口地址、视觉模型和 API 密钥。")
     parsed_crop_regions = parse_crop_regions(crop_regions, len(files))
 
     batch_ids: list[str] = []
@@ -2058,5 +2164,8 @@ async def create_upload(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="文件保存失败，请稍后重试。") from error
 
     for batch_id in batch_ids:
-        background_tasks.add_task(run_ocr, batch_id)
+        if recognition_mode == "ai":
+            background_tasks.add_task(run_direct_ai_ocr, batch_id, user.id)
+        else:
+            background_tasks.add_task(run_ocr, batch_id)
     return UploadResponse(id=batch_ids[0], status="queued", file_count=len(upload_records), batch_ids=batch_ids)

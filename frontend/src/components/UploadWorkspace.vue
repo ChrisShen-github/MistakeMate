@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { ArrowLeft, CheckCircle2, Crop, FileImage, FileText, ImagePlus, LoaderCircle, LockKeyhole, Trash2, UploadCloud } from '@lucide/vue'
+import { computed, onMounted, ref } from 'vue'
+import { ArrowLeft, CheckCircle2, Crop, FileImage, FileText, ImagePlus, LoaderCircle, LockKeyhole, ScanText, Sparkles, Trash2, UploadCloud } from '@lucide/vue'
 import ImageCropper, { type CropRegion } from './ImageCropper.vue'
 
-const emit = defineEmits<{ back: []; queued: [count: number] }>()
+const emit = defineEmits<{ back: []; queued: [count: number]; 'configure-ai': [] }>()
 const input = ref<HTMLInputElement | null>(null)
 const files = ref<File[]>([])
 const cropRegions = ref<(CropRegion | null)[]>([])
@@ -14,7 +14,9 @@ const errorMessage = ref('')
 const subject = ref('数学')
 const source = ref('作业')
 const note = ref('')
-const canSubmit = computed(() => files.value.length > 0 && !isSubmitting.value)
+const recognitionMode = ref<'local' | 'ai'>('local')
+const aiConfigured = ref(false)
+const canSubmit = computed(() => files.value.length > 0 && !isSubmitting.value && (recognitionMode.value === 'local' || aiConfigured.value))
 
 function chooseFiles() { input.value?.click() }
 function addFiles(incoming: FileList | File[]) {
@@ -35,6 +37,15 @@ function canCrop(file: File) { return ['image/jpeg', 'image/png', 'image/webp'].
 function openCrop(index: number) { activeCropIndex.value = index }
 function saveCrop(region: CropRegion | null) { if (activeCropIndex.value !== null) cropRegions.value[activeCropIndex.value] = region; activeCropIndex.value = null }
 function formatSize(size: number) { return size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / 1024 / 1024).toFixed(1)} MB` }
+function selectRecognitionMode(mode: 'local' | 'ai') { recognitionMode.value = mode; errorMessage.value = '' }
+async function loadAiAvailability() {
+  try {
+    const response = await fetch('/api/settings/ai')
+    if (!response.ok) return
+    const payload = await response.json()
+    aiConfigured.value = Boolean(payload.model && payload.api_key_configured)
+  } catch { /* The backend validates again when the upload starts. */ }
+}
 async function queueRecognition() {
   if (!canSubmit.value) return
   isSubmitting.value = true
@@ -43,6 +54,7 @@ async function queueRecognition() {
   formData.set('subject', subject.value)
   formData.set('source', source.value)
   formData.set('note', note.value.trim())
+  formData.set('recognition_mode', recognitionMode.value)
   formData.set('crop_regions', JSON.stringify(cropRegions.value))
   files.value.forEach((file) => formData.append('files', file))
   try {
@@ -59,13 +71,15 @@ async function queueRecognition() {
     isSubmitting.value = false
   }
 }
+
+onMounted(loadAiAvailability)
 </script>
 
 <template>
   <section class="upload-page" aria-labelledby="upload-heading">
     <button class="back-button" type="button" @click="emit('back')"><ArrowLeft :size="18" />返回今日任务</button>
-    <header class="upload-intro"><p class="eyebrow">添加到陈晨的错题本</p><h1 id="upload-heading">上传错题</h1><p>上传试卷、作业或错题照片。每张图片会单独生成一道待确认题目，再分别识别文字。</p></header>
-    <ol class="upload-steps" aria-label="上传步骤"><li class="active"><span>1</span><strong>上传文件</strong><small>图片或 PDF</small></li><li><span>2</span><strong>检查题目</strong><small>裁切与补充信息</small></li><li><span>3</span><strong>AI 整理</strong><small>知识点与复练建议</small></li></ol>
+    <header class="upload-intro"><p class="eyebrow">添加到陈晨的错题本</p><h1 id="upload-heading">上传错题</h1><p>上传试卷、作业或错题照片。每张图片会单独生成一道待确认题目，可选择本地 OCR 或 AI 视觉识别。</p></header>
+    <ol class="upload-steps" aria-label="上传步骤"><li class="active"><span>1</span><strong>上传文件</strong><small>图片或 PDF</small></li><li><span>2</span><strong>检查题目</strong><small>裁切与补充信息</small></li><li><span>3</span><strong>整理归档</strong><small>知识点与复练建议</small></li></ol>
 
     <div class="upload-layout">
       <section class="upload-card" aria-labelledby="file-heading">
@@ -77,15 +91,16 @@ async function queueRecognition() {
         <div v-if="files.length" class="file-list" aria-label="待识别文件"><article v-for="(file, index) in files" :key="`${file.name}-${file.size}`" class="file-row"><div class="file-icon"><FileText v-if="file.type === 'application/pdf'" :size="20" /><FileImage v-else :size="20" /></div><div class="file-info"><strong>{{ file.name }}</strong><span>{{ formatSize(file.size) }} · {{ cropRegions[index] ? '已截取识别范围' : '识别整张图片' }}</span></div><button v-if="canCrop(file)" class="crop-button" type="button" :aria-label="`截取 ${file.name} 的识别范围`" @click="openCrop(index)"><Crop :size="16" />{{ cropRegions[index] ? '调整范围' : '截取范围' }}</button><button class="remove-button" type="button" :aria-label="`移除 ${file.name}`" @click="removeFile(index)"><Trash2 :size="17" /></button></article></div>
       </section>
       <aside class="details-column">
-        <section class="details-card" aria-labelledby="details-heading"><div class="section-title"><div><p class="section-kicker">第二步</p><h2 id="details-heading">补充一点信息</h2></div></div><p class="details-tip">这能让 AI 更准确地判断知识点。其余信息可在识别后再修改。</p><div class="form-grid"><label>学科<select v-model="subject"><option>数学</option><option>语文</option><option>英语</option><option>其他</option></select></label><label>题目来源<select v-model="source"><option>作业</option><option>试卷</option><option>练习册</option><option>其他</option></select></label></div><label class="note-label">给自己留个备注 <span>可选</span><textarea v-model="note" placeholder="例如：第 2 单元周测，孩子说这题当时没看懂。"></textarea></label></section>
+        <section class="details-card" aria-labelledby="details-heading"><div class="section-title"><div><p class="section-kicker">第二步</p><h2 id="details-heading">补充一点信息</h2></div></div><p class="details-tip">这能让 AI 更准确地判断知识点。其余信息可在识别后再修改。</p><div class="form-grid"><label>学科<select v-model="subject"><option>数学</option><option>语文</option><option>英语</option><option>其他</option></select></label><label>题目来源<select v-model="source"><option>作业</option><option>试卷</option><option>练习册</option><option>其他</option></select></label></div><label class="note-label">给自己留个备注 <span>可选</span><textarea v-model="note" placeholder="例如：第 2 单元周测，孩子说这题当时没看懂。"></textarea></label><fieldset class="recognition-mode"><legend>识别方式</legend><button type="button" class="mode-choice" :class="{ active: recognitionMode === 'local' }" :aria-pressed="recognitionMode === 'local'" @click="selectRecognitionMode('local')"><ScanText :size="18" /><span><strong>本地 OCR</strong><small>免费、题图不离开设备</small></span></button><button type="button" class="mode-choice" :class="{ active: recognitionMode === 'ai' }" :aria-pressed="recognitionMode === 'ai'" @click="selectRecognitionMode('ai')"><Sparkles :size="18" /><span><strong>AI 视觉识别</strong><small>{{ aiConfigured ? '跳过本地 OCR，直接使用视觉模型' : '需要先完成 AI 设置' }}</small></span></button><p v-if="recognitionMode === 'ai'" class="mode-tip" :class="{ warning: !aiConfigured }">{{ aiConfigured ? '图片会发送给你配置的 AI 服务，适合手写、公式和复杂版面。' : '尚未配置视觉模型，请先完成 AI 设置后再上传。' }}<button v-if="!aiConfigured" type="button" @click="emit('configure-ai')">去配置 AI</button></p></fieldset></section>
         <section class="privacy-note"><LockKeyhole :size="19" /><div><strong>题目只用于生成你的错题本</strong><p>原图会保留，AI 识别结果可随时修改或删除。</p></div></section>
       </aside>
     </div>
-    <footer class="upload-footer"><p><CheckCircle2 :size="17" />每张文件会单独排队识别，之后可分别检查题目范围和文字。</p><button class="recognize-button" type="button" :disabled="!canSubmit" @click="queueRecognition"><LoaderCircle v-if="isSubmitting" class="spin" :size="18" />{{ isSubmitting ? '正在上传…' : files.length > 1 ? `生成 ${files.length} 道题并识别` : '开始识别' }}</button></footer>
+    <footer class="upload-footer"><p><CheckCircle2 :size="17" />每张文件会单独排队识别，之后可分别检查题目范围和文字。</p><button class="recognize-button" type="button" :disabled="!canSubmit" @click="queueRecognition"><LoaderCircle v-if="isSubmitting" class="spin" :size="18" />{{ isSubmitting ? '正在上传…' : recognitionMode === 'ai' ? (aiConfigured ? `使用 AI 识别${files.length > 1 ? ` ${files.length} 道题` : ''}` : '请先配置 AI') : files.length > 1 ? `生成 ${files.length} 道题并识别` : '开始识别' }}</button></footer>
     <ImageCropper v-if="activeCropIndex !== null && files[activeCropIndex]" :key="`${files[activeCropIndex].name}-${activeCropIndex}`" :file="files[activeCropIndex]" :initial-region="cropRegions[activeCropIndex]" @cancel="activeCropIndex = null" @confirm="saveCrop" />
   </section>
 </template>
 
 <style scoped>
 .upload-page { max-width: 1200px; margin: 0 auto; padding: 32px 44px 56px; }.back-button { display: inline-flex; align-items: center; gap: 7px; min-height: 44px; padding: 0; color: #315f9b; border: 0; background: transparent; font-size: 13px; font-weight: 700; }.upload-intro { margin-top: 18px; }.upload-intro h1 { margin: 0; color: #1e3553; font-size: 32px; letter-spacing: -.7px; }.upload-intro > p:last-child { max-width: 590px; margin: 10px 0 0; color: #667b92; line-height: 1.65; }.eyebrow,.section-kicker { margin: 0 0 7px; color: #788da5; font-size: 12px; font-weight: 700; letter-spacing: .35px; }.upload-steps { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; padding: 0; margin: 31px 0 23px; list-style: none; }.upload-steps li { display: grid; grid-template-columns: 31px 1fr; column-gap: 9px; align-items: center; padding: 12px; color: #718198; border: 1px solid #dfe6ed; border-radius: 10px; background: #fff; }.upload-steps li.active { color: #275dba; border-color: #a8c7ee; background: #f4f8ff; }.upload-steps li span { grid-row: span 2; display: grid; width: 30px; height: 30px; place-items: center; color: #64788e; background: #edf1f5; border-radius: 50%; font-size: 12px; font-weight: 700; }.upload-steps li.active span { color: #fff; background: #2563eb; }.upload-steps strong { font-size: 13px; }.upload-steps small { margin-top: 2px; font-size: 11px; }.upload-layout { display: grid; grid-template-columns: minmax(0,1.35fr) minmax(300px,.8fr); gap: 20px; }.upload-card,.details-card { padding: 24px; background: #fff; border: 1px solid #dfe6ed; border-radius: 14px; }.section-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }.section-title h2 { margin: 0; color: #203954; font-size: 19px; }.file-count { padding: 4px 7px; color: #526f93; background: #eff5fd; border-radius: 5px; font-size: 11px; font-weight: 700; }.drop-zone { display: grid; justify-items: center; margin-top: 19px; padding: 33px 20px; color: #50677f; border: 2px dashed #b9cae0; border-radius: 12px; background: #fbfdff; text-align: center; transition: border-color .18s ease, background .18s ease; cursor: pointer; }.drop-zone:hover,.drop-zone.dragging { border-color: #2563eb; background: #f3f8ff; }.drop-zone strong { margin-top: 11px; color: #2b4664; font-size: 15px; }.drop-zone > span { margin-top: 6px; font-size: 12px; }.drop-icon { display: grid; width: 52px; height: 52px; place-items: center; color: #2563eb; background: #e8f1ff; border-radius: 14px; }.choose-button { display: inline-flex; align-items: center; gap: 6px; min-height: 40px; margin-top: 17px; padding: 8px 11px; color: #255ba9; border: 1px solid #b9d0ef; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; }.upload-error { margin: 10px 0 0; color: #b54636; font-size: 12px; }.file-list { display: grid; gap: 8px; margin-top: 16px; }.file-row { display: flex; align-items: center; gap: 9px; padding: 10px 8px; border: 1px solid #e4eaf0; border-radius: 9px; }.file-icon { display: grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center; color: #356fca; background: #edf4ff; border-radius: 8px; }.file-info { display: grid; min-width: 0; gap: 3px; flex: 1; }.file-info strong { overflow: hidden; color: #344b65; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }.file-info span { color: #72849a; font-size: 11px; }.crop-button { display: inline-flex; min-height: 40px; align-items: center; justify-content: center; gap: 5px; padding: 7px 9px; color: #275dba; border: 1px solid #b9d0ef; border-radius: 7px; background: #f7fbff; font-size: 11px; font-weight: 700; white-space: nowrap; cursor: pointer; transition: border-color .18s ease, background .18s ease; }.crop-button:hover { border-color: #78a7df; background: #edf5ff; }.remove-button { display: grid; width: 40px; height: 40px; flex: 0 0 auto; place-items: center; color: #718198; border: 0; border-radius: 7px; background: transparent; cursor: pointer; }.remove-button:hover { color: #b54636; background: #fff1ef; }.crop-button:focus-visible,.remove-button:focus-visible { outline: 3px solid rgba(37,99,235,.2); outline-offset: 2px; }.details-column { display: grid; align-content: start; gap: 14px; }.details-tip { margin: 12px 0 16px; color: #667b92; font-size: 12px; line-height: 1.6; }.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }.form-grid label,.note-label { display: grid; gap: 7px; color: #405a75; font-size: 12px; font-weight: 700; }.form-grid select,.note-label textarea { width: 100%; color: #2d4662; border: 1px solid #cbd8e6; border-radius: 8px; background: #fff; font: inherit; font-size: 14px; }.form-grid select { min-height: 44px; padding: 0 11px; }.note-label { margin-top: 15px; }.note-label span { color: #8596a8; font-size: 11px; font-weight: 500; }.note-label textarea { min-height: 91px; padding: 11px; resize: vertical; line-height: 1.5; }.form-grid select:focus,.note-label textarea:focus { border-color: #2563eb; outline: 3px solid rgba(37,99,235,.16); }.privacy-note { display: flex; gap: 10px; padding: 15px; color: #456789; border: 1px solid #d7e5f6; border-radius: 12px; background: #f5faff; }.privacy-note svg { flex: 0 0 auto; margin-top: 1px; color: #2c68ca; }.privacy-note strong { font-size: 12px; }.privacy-note p { margin: 4px 0 0; color: #607993; font-size: 11px; line-height: 1.5; }.upload-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 22px; padding: 17px 0 0; border-top: 1px solid #e0e7ee; }.upload-footer p { display: flex; align-items: flex-start; gap: 7px; margin: 0; color: #61768d; font-size: 12px; line-height: 1.5; }.upload-footer p svg { flex: 0 0 auto; color: #32866a; }.recognize-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 137px; min-height: 46px; padding: 10px 15px; color: #fff; border: 0; border-radius: 9px; background: #f97316; font-size: 13px; font-weight: 700; transition: background .18s ease, opacity .18s ease; }.recognize-button:hover:not(:disabled) { background: #dc5f0b; }.recognize-button:disabled { cursor: not-allowed; opacity: .46; }.spin { animation: rotate .8s linear infinite; }@keyframes rotate { to { transform: rotate(360deg); } }@media (max-width: 760px) { .upload-page { padding: 22px 17px 42px; }.upload-intro h1 { font-size: 27px; }.upload-steps { gap: 7px; margin-top: 25px; }.upload-steps li { grid-template-columns: 27px 1fr; padding: 9px 7px; column-gap: 6px; }.upload-steps li span { width: 26px; height: 26px; }.upload-steps strong { font-size: 11px; }.upload-steps small { display: none; }.upload-layout { grid-template-columns: 1fr; gap: 13px; }.upload-card,.details-card { padding: 19px 16px; }.drop-zone { padding: 28px 14px; }.file-row { align-items: center; flex-wrap: wrap; }.file-info { flex-basis: calc(100% - 88px); }.crop-button { min-height: 44px; margin-left: 43px; flex: 1; }.remove-button { width: 44px; height: 44px; }.upload-footer { align-items: stretch; flex-direction: column; }.recognize-button { width: 100%; }.upload-footer p { padding: 0 2px; } }@media (prefers-reduced-motion: reduce) { .drop-zone,.crop-button,.recognize-button { transition: none; }.spin { animation: none; } }
+.recognition-mode { display: grid; gap: 8px; margin: 18px 0 0; padding: 0; border: 0; }.recognition-mode legend { padding: 0; color: #405a75; font-size: 12px; font-weight: 700; }.mode-choice { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 58px; padding: 10px; color: #516a84; border: 1px solid #d6e1ec; border-radius: 9px; background: #fff; text-align: left; cursor: pointer; transition: border-color .18s ease, background .18s ease; }.mode-choice:hover { border-color: #9ebce4; background: #f8fbff; }.mode-choice.active { color: #255da8; border-color: #72a4e1; background: #f2f7ff; box-shadow: 0 0 0 3px rgba(65,123,209,.1); }.mode-choice > svg { flex: 0 0 auto; }.mode-choice > span { display: grid; gap: 2px; }.mode-choice strong { font-size: 12px; }.mode-choice small,.mode-tip { color: #71859c; font-size: 11px; line-height: 1.45; }.mode-tip { margin: 0; }.mode-tip.warning { color: #9a6a22; }.mode-tip button { min-height: 32px; margin: 7px 0 0; padding: 5px 8px; color: #2e63b6; border: 0; border-radius: 6px; background: #eaf3ff; font: inherit; font-size: 11px; font-weight: 700; cursor: pointer; }
 </style>

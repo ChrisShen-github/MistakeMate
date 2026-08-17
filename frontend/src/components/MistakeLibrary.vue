@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { BookOpenCheck, FileQuestion, FileStack, Image, Printer, RefreshCw, Upload } from '@lucide/vue'
+import { BookOpenCheck, CircleX, FileQuestion, FileStack, Image, Printer, RefreshCw, Trash2, Upload } from '@lucide/vue'
 
 type MistakeBatch = {
   id: string
@@ -18,6 +18,9 @@ const activeSubject = ref('全部学科')
 const batches = ref<MistakeBatch[]>([])
 const isLoading = ref(true)
 const errorMessage = ref('')
+const actionBatchId = ref('')
+const actionMessage = ref('')
+const actionError = ref('')
 
 const totalFiles = computed(() => batches.value.reduce((total, batch) => total + batch.file_count, 0))
 
@@ -33,7 +36,69 @@ function statusLabel(status: string) {
     review_ready: '待确认',
     confirmed: '已确认',
     ocr_failed: '识别失败',
+    ocr_cancelled: '已取消',
   }[status] ?? status
+}
+
+function isProcessing(batch: MistakeBatch) { return ['queued', 'recognizing'].includes(batch.status) }
+function isActing(batch: MistakeBatch) { return actionBatchId.value === batch.id }
+
+async function cancelRecognition(batch: MistakeBatch) {
+  if (isActing(batch)) return
+  actionBatchId.value = batch.id
+  actionMessage.value = ''
+  actionError.value = ''
+  try {
+    const response = await fetch(`/api/mistakes/${batch.id}/ocr/cancel`, { method: 'POST' })
+    const payload = await response.json().catch(() => ({ detail: '无法取消识别。' }))
+    if (!response.ok) throw new Error(payload.detail)
+    actionMessage.value = '已取消识别，原图会继续保留。'
+    await loadBatches()
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : '无法取消识别。'
+  } finally {
+    actionBatchId.value = ''
+  }
+}
+
+async function restartRecognition(batch: MistakeBatch) {
+  if (isActing(batch)) return
+  if (!window.confirm('重新识别会覆盖当前题干、选项和 OCR 初稿，并清空已拆分的小问；难度、知识点和错因会保留。确定继续吗？')) return
+  actionBatchId.value = batch.id
+  actionMessage.value = ''
+  actionError.value = ''
+  try {
+    const response = await fetch(`/api/mistakes/${batch.id}/ocr?replace_question=true`, { method: 'POST' })
+    const payload = await response.json().catch(() => ({ detail: '无法启动重新识别。' }))
+    if (!response.ok) throw new Error(payload.detail)
+    actionMessage.value = '已重新加入识别队列。'
+    await loadBatches()
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : '无法启动重新识别。'
+  } finally {
+    actionBatchId.value = ''
+  }
+}
+
+async function deleteBatch(batch: MistakeBatch) {
+  if (isActing(batch)) return
+  if (!window.confirm(`删除这道${batch.subject}${batch.source}错题吗？原图、OCR 结果和题目内容都会删除，无法恢复。`)) return
+  actionBatchId.value = batch.id
+  actionMessage.value = ''
+  actionError.value = ''
+  try {
+    const response = await fetch(`/api/mistakes/${batch.id}`, { method: 'DELETE' })
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({ detail: '无法删除错题。' }))
+      throw new Error(payload.detail)
+    }
+    actionMessage.value = '错题已删除。'
+    await loadBatches()
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : '无法删除错题。'
+  } finally {
+    actionBatchId.value = ''
+  }
 }
 
 async function loadBatches() {
@@ -71,6 +136,8 @@ onMounted(loadBatches)
       <div><span>待处理文件</span><strong>{{ totalFiles }}<small> 个</small></strong></div>
       <p><BookOpenCheck :size="18" />先完成识别，才会进入复练计划。</p>
     </section>
+    <p v-if="actionMessage" class="action-feedback success" role="status">{{ actionMessage }}</p>
+    <p v-if="actionError" class="action-feedback error" role="alert">{{ actionError }}</p>
 
     <div class="filter-row" aria-label="按学科筛选">
       <span>学科</span>
@@ -109,11 +176,16 @@ onMounted(loadBatches)
           <p>{{ batch.note || '暂未填写备注，可在识别结果出来后补充。' }}</p>
           <small>{{ formatDate(batch.created_at) }} · {{ batch.file_count }} 个文件</small>
         </div>
-        <button class="batch-action" type="button" :aria-label="`查看${batch.subject}${batch.source}错题`" @click="emit('open', batch)">查看</button>
+        <div class="batch-actions">
+          <button class="batch-action" type="button" :aria-label="`查看${batch.subject}${batch.source}错题`" @click="emit('open', batch)">查看</button>
+          <button v-if="isProcessing(batch)" class="batch-action cancel" type="button" :disabled="isActing(batch)" @click="cancelRecognition(batch)"><CircleX :size="16" />{{ isActing(batch) ? '取消中…' : '取消' }}</button>
+          <button v-else class="batch-action reocr" type="button" :disabled="isActing(batch)" @click="restartRecognition(batch)"><RefreshCw :size="16" />{{ isActing(batch) ? '处理中…' : '重新识别' }}</button>
+          <button class="batch-action delete" type="button" :disabled="isActing(batch)" :aria-label="`删除${batch.subject}${batch.source}错题`" @click="deleteBatch(batch)"><Trash2 :size="16" />删除</button>
+        </div>
       </article>
     </section>
 
-    <p class="library-footnote"><FileStack :size="16" />原图已保存在你的本地存储中；删除功能会在题目确认页提供。</p>
+    <p class="library-footnote"><FileStack :size="16" />原图保存在本地存储中；删除操作会同时移除原图和识别结果。</p>
   </section>
 </template>
 
@@ -125,4 +197,6 @@ onMounted(loadBatches)
 .library-print { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 7px; padding: 10px 13px; color: #315f9b; border: 1px solid #b9d0ef; border-radius: 9px; background: #fff; font-size: 13px; font-weight: 700; cursor: pointer; transition: background .2s ease,border-color .2s ease,color .2s ease; }
 .library-print:hover { color: #184f9f; border-color: #789fd3; background: #f7fbff; }
 @media (max-width: 760px) { .heading-actions { width: 100%; display: grid; grid-template-columns: 1fr 1fr; }.library-print,.library-upload { width: 100%; } }
+.action-feedback { margin: 13px 0 -5px; padding: 10px 13px; border-radius: 9px; font-size: 13px; font-weight: 700; }.action-feedback.success { color: #24745a; border: 1px solid #bfe7d4; background: #edf9f3; }.action-feedback.error { color: #a44338; border: 1px solid #f1c7c0; background: #fff3f1; }.batch-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }.batch-action { gap: 5px; }.batch-action.cancel { color: #9a6a22; border-color: #e8ca91; background: #fffbef; }.batch-action.reocr { color: #315f9b; border-color: #b9d0ef; background: #f7fbff; }.batch-action.delete { color: #aa4b40; border-color: #e7b9b2; background: #fff; }.batch-action:disabled { cursor: wait; opacity: .58; }.batch-action.cancel:hover { color: #7c5113; border-color: #d6ad5e; background: #fff5d9; }.batch-action.reocr:hover { color: #184f9f; border-color: #789fd3; background: #edf5ff; }.batch-action.delete:hover { color: #8a352d; border-color: #d9988f; background: #fff4f2; }.status-chip.ocr_cancelled { color: #746248; background: #f2eee8; }
+@media (max-width: 760px) { .batch-card { flex-wrap: wrap; }.batch-actions { width: 100%; justify-content: stretch; }.batch-actions .batch-action { flex: 1; } }
 </style>

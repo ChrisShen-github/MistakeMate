@@ -244,7 +244,7 @@ onMounted(async () => {
         </div>
       </header>
 
-      <UploadWorkspace v-if="currentView === 'upload'" @back="closeUpload" @queued="onRecognitionQueued" />
+      <UploadWorkspace v-if="currentView === 'upload'" @back="closeUpload" @queued="onRecognitionQueued" @configure-ai="openAiSettings" />
       <MistakeLibrary v-else-if="currentView === 'library'" @upload="openUpload" @print="openPrint" @open="openBatch($event.id)" />
       <BatchReview v-else-if="currentView === 'review'" :batch-id="activeBatchId" @back="openLibrary" @configure-ai="openAiSettings" />
       <PrintWorkspace v-else-if="currentView === 'print'" @back="closePrint" />

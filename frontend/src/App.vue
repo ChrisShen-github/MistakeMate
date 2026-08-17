@@ -138,7 +138,7 @@ function startReview() {
 function onRecognitionQueued(count: number) {
   activeNav.value = '我的错题'
   currentView.value = 'library'
-  showNotice(`已上传 ${count} 个文件，下一步将进入题目检查。`)
+  showNotice(`已创建 ${count} 道待确认题目，正在依次识别。`)
 }
 
 function onAuthenticated(user: SignedInUser) {

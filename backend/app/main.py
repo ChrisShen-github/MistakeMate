@@ -210,6 +210,7 @@ class UploadResponse(BaseModel):
     id: str
     status: str
     file_count: int
+    batch_ids: list[str]
 
 
 class MistakeBatchResponse(BaseModel):
@@ -1228,6 +1229,89 @@ def run_ocr(batch_id: str, replace_question: bool = False) -> None:
             run.completed_at = datetime.now(timezone.utc)
 
 
+def split_upload_batch_by_file(batch_id: str, user_id: str) -> list[str]:
+    """Turn a legacy multi-file upload into one independent batch per file.
+
+    Older MistakeMate versions combined all selected files into one OCR result.
+    The files keep their IDs (and any selected crop regions) while being moved
+    into new one-file batches, then OCR is run again for each individual image.
+    """
+    with SessionLocal() as session:
+        batch = session.get(UploadBatch, batch_id)
+        if batch is None or batch.owner_id != user_id:
+            raise ValueError("未找到需要拆分的上传批次。")
+        files = list(batch.files)
+        if len(files) < 2:
+            raise ValueError("这个上传批次只有一个文件，无需拆分。")
+        if any(question.status == "confirmed" for question in batch.questions):
+            raise ValueError("这组题目已有已确认内容，不能自动拆分。")
+        batch_values = {
+            "subject": batch.subject,
+            "source": batch.source,
+            "note": batch.note,
+            "created_at": batch.created_at,
+        }
+        file_values = [(file.id, file.stored_name) for file in files]
+
+    legacy_directory = storage_root / "uploads" / batch_id
+    if not legacy_directory.is_dir():
+        raise ValueError("原始文件目录不存在，无法拆分。")
+
+    new_batch_ids = [str(uuid4()) for _ in file_values]
+    moved_files: list[tuple[Path, Path]] = []
+    try:
+        for (_, stored_name), new_batch_id in zip(file_values, new_batch_ids, strict=True):
+            source_path = legacy_directory / stored_name
+            destination_directory = storage_root / "uploads" / new_batch_id
+            destination_path = destination_directory / stored_name
+            if not source_path.is_file():
+                raise ValueError(f"缺少原始文件：{stored_name}")
+            destination_directory.mkdir(parents=True, exist_ok=False)
+            shutil.move(str(source_path), str(destination_path))
+            moved_files.append((source_path, destination_path))
+
+        with SessionLocal.begin() as session:
+            legacy_batch = session.get(UploadBatch, batch_id)
+            if legacy_batch is None or legacy_batch.owner_id != user_id:
+                raise ValueError("上传批次已变化，请刷新后重试。")
+            files_by_id = {file.id: file for file in legacy_batch.files}
+            for (file_id, _), new_batch_id in zip(file_values, new_batch_ids, strict=True):
+                file = files_by_id.get(file_id)
+                if file is None:
+                    raise ValueError("上传文件已变化，请刷新后重试。")
+                new_batch = UploadBatch(
+                    id=new_batch_id,
+                    owner_id=user_id,
+                    subject=batch_values["subject"],
+                    source=batch_values["source"],
+                    note=batch_values["note"],
+                    status="queued",
+                    created_at=batch_values["created_at"],
+                    files=[file],
+                )
+                session.add(new_batch)
+            session.flush()
+            for new_batch_id in new_batch_ids:
+                session.add(OcrRun(batch_id=new_batch_id))
+            legacy_run = session.get(OcrRun, batch_id)
+            if legacy_run is not None:
+                session.delete(legacy_run)
+            session.delete(legacy_batch)
+        legacy_directory.rmdir()
+    except Exception:
+        for source_path, destination_path in reversed(moved_files):
+            if destination_path.exists():
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(destination_path), str(source_path))
+            try:
+                destination_path.parent.rmdir()
+            except OSError:
+                pass
+        raise
+
+    return new_batch_ids
+
+
 def call_ai_chat(config: AiProviderConfig, messages: list[dict[str, Any]], max_tokens: int = 5000) -> str:
     api_key = decrypt_api_key(config.encrypted_api_key)
     if not api_key:
@@ -1881,14 +1965,16 @@ async def create_upload(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"一次最多上传 {MAX_FILES_PER_BATCH} 个文件。")
     parsed_crop_regions = parse_crop_regions(crop_regions, len(files))
 
-    batch_id = str(uuid4())
-    batch_directory = storage_root / "uploads" / batch_id
-    batch_directory.mkdir(parents=True, exist_ok=False)
-    file_records: list[UploadedFile] = []
-    region_records: list[OcrRegion] = []
+    batch_ids: list[str] = []
+    batch_directories: list[Path] = []
+    upload_records: list[tuple[str, UploadedFile, OcrRegion | None]] = []
 
     try:
         for file_index, uploaded in enumerate(files):
+            batch_id = str(uuid4())
+            batch_directory = storage_root / "uploads" / batch_id
+            batch_directory.mkdir(parents=True, exist_ok=False)
+            batch_directories.append(batch_directory)
             original_name = uploaded.filename or "untitled"
             extension = Path(original_name).suffix.lower()
             content_type = uploaded.content_type or "application/octet-stream"
@@ -1908,44 +1994,51 @@ async def create_upload(
             await uploaded.close()
             file_record = UploadedFile(
                 id=str(uuid4()),
+                batch_id=batch_id,
                 original_name=original_name[:255],
                 stored_name=stored_name,
                 content_type=content_type,
                 size=size,
             )
-            file_records.append(file_record)
             region = parsed_crop_regions[file_index]
+            region_record = None
             if region is not None:
-                region_records.append(
-                    OcrRegion(
-                        file_id=file_record.id,
-                        x=region[0],
-                        y=region[1],
-                        width=region[2],
-                        height=region[3],
-                    )
+                region_record = OcrRegion(
+                    file_id=file_record.id,
+                    x=region[0],
+                    y=region[1],
+                    width=region[2],
+                    height=region[3],
                 )
+            batch_ids.append(batch_id)
+            upload_records.append((batch_id, file_record, region_record))
 
         with SessionLocal.begin() as session:
-            batch = UploadBatch(
-                id=batch_id,
-                owner_id=user.id,
-                subject=subject.strip(),
-                source=source.strip(),
-                note=note.strip(),
-                status="queued",
-                files=file_records,
-            )
-            session.add(batch)
+            for batch_id, file_record, region_record in upload_records:
+                batch = UploadBatch(
+                    id=batch_id,
+                    owner_id=user.id,
+                    subject=subject.strip(),
+                    source=source.strip(),
+                    note=note.strip(),
+                    status="queued",
+                    files=[file_record],
+                )
+                session.add(batch)
             session.flush()
-            session.add(OcrRun(batch_id=batch_id))
-            session.add_all(region_records)
+            for batch_id, _, region_record in upload_records:
+                session.add(OcrRun(batch_id=batch_id))
+                if region_record is not None:
+                    session.add(region_record)
     except HTTPException:
-        shutil.rmtree(batch_directory, ignore_errors=True)
+        for batch_directory in batch_directories:
+            shutil.rmtree(batch_directory, ignore_errors=True)
         raise
     except Exception as error:
-        shutil.rmtree(batch_directory, ignore_errors=True)
+        for batch_directory in batch_directories:
+            shutil.rmtree(batch_directory, ignore_errors=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="文件保存失败，请稍后重试。") from error
 
-    background_tasks.add_task(run_ocr, batch_id)
-    return UploadResponse(id=batch_id, status="queued", file_count=len(file_records))
+    for batch_id in batch_ids:
+        background_tasks.add_task(run_ocr, batch_id)
+    return UploadResponse(id=batch_ids[0], status="queued", file_count=len(upload_records), batch_ids=batch_ids)

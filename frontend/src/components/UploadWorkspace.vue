@@ -64,14 +64,14 @@ async function queueRecognition() {
 <template>
   <section class="upload-page" aria-labelledby="upload-heading">
     <button class="back-button" type="button" @click="emit('back')"><ArrowLeft :size="18" />返回今日任务</button>
-    <header class="upload-intro"><p class="eyebrow">添加到陈晨的错题本</p><h1 id="upload-heading">上传错题</h1><p>上传试卷、作业或错题照片。系统会先优化图片，再协助你拆分题目和识别文字。</p></header>
+    <header class="upload-intro"><p class="eyebrow">添加到陈晨的错题本</p><h1 id="upload-heading">上传错题</h1><p>上传试卷、作业或错题照片。每张图片会单独生成一道待确认题目，再分别识别文字。</p></header>
     <ol class="upload-steps" aria-label="上传步骤"><li class="active"><span>1</span><strong>上传文件</strong><small>图片或 PDF</small></li><li><span>2</span><strong>检查题目</strong><small>裁切与补充信息</small></li><li><span>3</span><strong>AI 整理</strong><small>知识点与复练建议</small></li></ol>
 
     <div class="upload-layout">
       <section class="upload-card" aria-labelledby="file-heading">
         <div class="section-title"><div><p class="section-kicker">第一步</p><h2 id="file-heading">选择错题图片</h2></div><span class="file-count">{{ files.length }}/12</span></div>
         <div class="drop-zone" :class="{ dragging: isDragging }" aria-describedby="upload-tip upload-error" @dragenter.prevent="isDragging = true" @dragover.prevent="isDragging = true" @dragleave.prevent="isDragging = false" @drop.prevent="onDrop">
-          <div class="drop-icon"><UploadCloud :size="27" /></div><strong>拖入图片，或点这里选择文件</strong><span id="upload-tip">支持 JPG、PNG、WebP、HEIC、PDF；单个文件最大 20 MB</span><button class="choose-button" type="button" @click.stop="chooseFiles"><ImagePlus :size="17" />选择文件</button><input ref="input" class="sr-only" type="file" accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.pdf" multiple @change="onInputChange" />
+          <div class="drop-icon"><UploadCloud :size="27" /></div><strong>拖入图片，或点这里选择文件</strong><span id="upload-tip">支持 JPG、PNG、WebP、HEIC、PDF；每张文件会单独生成一道题</span><button class="choose-button" type="button" @click.stop="chooseFiles"><ImagePlus :size="17" />选择文件</button><input ref="input" class="sr-only" type="file" accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.pdf" multiple @change="onInputChange" />
         </div>
         <p v-if="errorMessage" id="upload-error" class="upload-error" role="alert">{{ errorMessage }}</p>
         <div v-if="files.length" class="file-list" aria-label="待识别文件"><article v-for="(file, index) in files" :key="`${file.name}-${file.size}`" class="file-row"><div class="file-icon"><FileText v-if="file.type === 'application/pdf'" :size="20" /><FileImage v-else :size="20" /></div><div class="file-info"><strong>{{ file.name }}</strong><span>{{ formatSize(file.size) }} · {{ cropRegions[index] ? '已截取识别范围' : '识别整张图片' }}</span></div><button v-if="canCrop(file)" class="crop-button" type="button" :aria-label="`截取 ${file.name} 的识别范围`" @click="openCrop(index)"><Crop :size="16" />{{ cropRegions[index] ? '调整范围' : '截取范围' }}</button><button class="remove-button" type="button" :aria-label="`移除 ${file.name}`" @click="removeFile(index)"><Trash2 :size="17" /></button></article></div>
@@ -81,7 +81,7 @@ async function queueRecognition() {
         <section class="privacy-note"><LockKeyhole :size="19" /><div><strong>题目只用于生成你的错题本</strong><p>原图会保留，AI 识别结果可随时修改或删除。</p></div></section>
       </aside>
     </div>
-    <footer class="upload-footer"><p><CheckCircle2 :size="17" />上传后，你仍可以在下一步调整题目范围和识别结果。</p><button class="recognize-button" type="button" :disabled="!canSubmit" @click="queueRecognition"><LoaderCircle v-if="isSubmitting" class="spin" :size="18" />{{ isSubmitting ? '正在准备…' : '开始 AI 识别' }}</button></footer>
+    <footer class="upload-footer"><p><CheckCircle2 :size="17" />每张文件会单独排队识别，之后可分别检查题目范围和文字。</p><button class="recognize-button" type="button" :disabled="!canSubmit" @click="queueRecognition"><LoaderCircle v-if="isSubmitting" class="spin" :size="18" />{{ isSubmitting ? '正在上传…' : files.length > 1 ? `生成 ${files.length} 道题并识别` : '开始识别' }}</button></footer>
     <ImageCropper v-if="activeCropIndex !== null && files[activeCropIndex]" :key="`${files[activeCropIndex].name}-${activeCropIndex}`" :file="files[activeCropIndex]" :initial-region="cropRegions[activeCropIndex]" @cancel="activeCropIndex = null" @confirm="saveCrop" />
   </section>
 </template>

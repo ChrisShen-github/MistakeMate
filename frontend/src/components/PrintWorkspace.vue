@@ -13,6 +13,7 @@ import {
   Save,
   Trash2,
 } from '@lucide/vue'
+import QuestionText from './QuestionText.vue'
 import type { MistakeQuestion, QuestionPart } from '../types/questions'
 
 type PrintableQuestion = MistakeQuestion & {
@@ -240,7 +241,8 @@ function moveQuestion(id: string, direction: -1 | 1) {
 function estimatedTextHeight(text: string, charactersPerLine: number) {
   const explicitLines = Math.max(1, text.split(/\r?\n/).length)
   const wrappedLines = Math.max(explicitLines, Math.ceil(Math.max(text.length, 1) / charactersPerLine))
-  return wrappedLines * settings.value.fontSize * 0.3528 * settings.value.lineHeight
+  const tableRowCount = text.split(/\r?\n/).filter((line) => /^\s*\|?.+\|.+\|?\s*$/.test(line) && !/^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line)).length
+  return (wrappedLines + tableRowCount * .8) * settings.value.fontSize * 0.3528 * settings.value.lineHeight
 }
 
 function estimateQuestionHeight(question: PrintableQuestion) {
@@ -477,7 +479,7 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
                         <span v-if="settings.showDifficulty">难度 {{ '★'.repeat(item.question.difficulty) }}</span>
                         <span v-if="settings.showDate">{{ formatDate(item.question.batch_created_at) }}</span>
                       </div>
-                      <p class="question-stem">{{ item.question.stem }}</p>
+                      <QuestionText class="question-stem" :text="item.question.stem" />
                       <ol v-if="item.question.options.length" class="option-list">
                         <li v-for="option in item.question.options" :key="option.label"><strong>{{ option.label }}.</strong>{{ option.text }}</li>
                       </ol>
@@ -603,4 +605,5 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
 @media(max-width:1180px){.studio-grid{grid-template-columns:240px minmax(430px,1fr)}.settings-panel{grid-column:1/-1;position:static;display:grid;grid-template-columns:1fr 1fr;max-height:none}.settings-panel>.panel-heading,.settings-panel>.template-section,.settings-panel>.save-template-box,.settings-panel>.save-template-button,.settings-panel>.notice-message,.settings-panel>.inline-error{grid-column:1/-1}.settings-panel details{border:1px solid #e3e9ef;border-right:0;border-left:0}.page-stage{max-height:none}}
 @media(max-width:900px){.print-workspace{padding:18px 14px 88px}.studio-heading{align-items:stretch;flex-direction:column}.studio-heading h1{font-size:26px}.heading-actions{display:none}.mobile-steps{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:16px;padding:4px;border-radius:10px;background:#e9eff6}.mobile-steps button{min-height:42px;color:#627990;border:0;border-radius:7px;background:transparent;font-size:12px;font-weight:700}.mobile-steps button.active{color:#285faa;background:#fff;box-shadow:0 1px 4px rgba(46,72,101,.13)}.studio-grid{display:block;margin-top:12px}.studio-panel,.preview-panel{display:none}.studio-panel.mobile-visible,.preview-panel.mobile-visible{display:block}.questions-panel,.settings-panel{position:static;max-height:none}.question-editor-list{max-height:none}.settings-panel.mobile-visible{display:block}.preview-panel{margin-inline:-14px;border-right:0;border-left:0;border-radius:0}.preview-toolbar{border-radius:0}.page-stage{padding:12px 8px}.page-stack{zoom:.48}.zoom-note{display:none}.mobile-bottom-bar{position:fixed;z-index:30;right:0;bottom:0;left:0;display:flex;min-height:68px;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));color:#516a82;border-top:1px solid #d6e0ea;background:rgba(255,255,255,.96);box-shadow:0 -4px 18px rgba(34,58,83,.1);font-size:12px;font-weight:700}.mobile-bottom-bar button{min-width:116px}.template-grid{grid-template-columns:1fr 1fr}}
 @media print{:global(.sidebar),:global(.topbar),:global(.toast),.screen-only{display:none!important}:global(html),:global(body),:global(.app-shell),:global(.main-content){min-height:0!important;margin:0!important;background:#fff!important}.print-workspace,.studio-grid,.preview-panel,.page-stage,.page-stack{display:block!important;width:auto!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;overflow:visible!important;border:0!important;background:#fff!important;zoom:1!important}.paper-sheet,.paper-sheet.imposed{width:var(--paper-width);height:var(--paper-height);margin:0;background:#fff;box-shadow:none;break-after:page;page-break-after:always}.paper-sheet.imposed .trim-area{box-shadow:none}.paper-sheet:last-child{break-after:auto;page-break-after:auto}}
+.question-stem :deep(.table-scroll){margin:1.6mm 0;overflow:visible;border-color:#96a5b3;border-radius:0}.question-stem :deep(table){min-width:0;table-layout:fixed;font-size:calc(var(--paper-font-size) - .35pt)}.question-stem :deep(th),.question-stem :deep(td){padding:1.25mm 1.6mm;border-color:#aebac5;overflow-wrap:anywhere}.question-stem :deep(th){color:#1f2937;background:#edf1f4}
 </style>

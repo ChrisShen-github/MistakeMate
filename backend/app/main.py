@@ -1374,7 +1374,8 @@ def build_ai_ocr_messages(batch_id: str, local_ocr_text: str) -> list[dict[str, 
     prompt = (
         "请复核这些试题图片，并结合下面的本地 OCR 初稿，输出完整、可编辑的题面文字。"
         "补全漏字，修正明显错字，保留题号、选项、小问、公式与换行。不要解题，不要添加答案，"
-        "不要解释；看不清的内容标记为［无法确认］。\n\n本地 OCR 初稿：\n" + local_ocr_text[:16000]
+        "不要解释；看不清的内容标记为［无法确认］。图片中有表格时，请使用标准 Markdown 表格（表头、分隔行、数据行），"
+        "不要用 ASCII 横线或空格模拟表格。\n\n本地 OCR 初稿：\n" + local_ocr_text[:16000]
     )
     return build_ai_image_messages(batch_id, prompt)
 
@@ -1382,8 +1383,8 @@ def build_ai_ocr_messages(batch_id: str, local_ocr_text: str) -> list[dict[str, 
 def build_direct_ai_ocr_messages(batch_id: str) -> list[dict[str, Any]]:
     prompt = (
         "请直接转写这些试题图片，输出完整、可编辑的题面文字。"
-        "保留题号、选项、小问、公式与换行。不要解题，不要添加答案，不要解释；"
-        "看不清的内容标记为［无法确认］。"
+        "保留题号、选项、小问、公式与换行。图片中有表格时，请使用标准 Markdown 表格（表头、分隔行、数据行），"
+        "不要用 ASCII 横线或空格模拟表格。不要解题，不要添加答案，不要解释；看不清的内容标记为［无法确认］。"
     )
     return build_ai_image_messages(batch_id, prompt)
 
@@ -1461,7 +1462,7 @@ def run_ai_ocr_assist(batch_id: str, user_id: str) -> None:
             run.ai_completed_at = datetime.now(timezone.utc)
 
 
-def run_direct_ai_ocr(batch_id: str, user_id: str) -> None:
+def run_direct_ai_ocr(batch_id: str, user_id: str, replace_question: bool = False) -> None:
     with SessionLocal.begin() as session:
         batch = session.get(UploadBatch, batch_id)
         run = session.get(OcrRun, batch_id)
@@ -1490,7 +1491,7 @@ def run_direct_ai_ocr(batch_id: str, user_id: str) -> None:
             run.status = "completed"
             run.text = ai_text
             run.completed_at = datetime.now(timezone.utc)
-            create_question_draft_if_missing(session, batch_id, ai_text)
+            create_question_draft_if_missing(session, batch_id, ai_text, force_replace=replace_question)
     except Exception as error:
         with SessionLocal.begin() as session:
             batch = session.get(UploadBatch, batch_id)
@@ -1912,16 +1913,30 @@ def get_uploaded_file(batch_id: str, file_id: str, user: AppUser = Depends(requi
 
 
 @app.post("/api/mistakes/{batch_id}/ocr", response_model=OcrRunResponse, status_code=status.HTTP_202_ACCEPTED)
-def request_ocr(batch_id: str, background_tasks: BackgroundTasks, replace_question: bool = False, user: AppUser = Depends(require_user)) -> OcrRunResponse:
-    if not ocr_models_ready():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="本地 OCR 模型尚未下载，请先在“OCR 模型”页面完成下载。")
+def request_ocr(
+    batch_id: str,
+    background_tasks: BackgroundTasks,
+    replace_question: bool = False,
+    recognition_mode: str | None = None,
+    user: AppUser = Depends(require_user),
+) -> OcrRunResponse:
     with SessionLocal.begin() as session:
         batch = get_owned_batch(session, batch_id, user.id)
         run = session.get(OcrRun, batch_id)
         if run is None:
             run = OcrRun(batch_id=batch_id)
             session.add(run)
+        mode = recognition_mode or ("ai" if run.engine == "AI 视觉识别" else "local")
+        if mode not in {"local", "ai"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="识别方式不正确。")
+        if mode == "ai":
+            config = session.get(AiProviderConfig, user.id)
+            if config is None or not config.model or not config.encrypted_api_key:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中填写接口地址、视觉模型和 API 密钥。")
+        elif not ocr_models_ready():
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="本地 OCR 模型尚未下载，请先在“OCR 模型”页面完成下载。")
         batch.status = "queued"
+        run.engine = "AI 视觉识别" if mode == "ai" else "PaddleOCR PP-OCRv6"
         run.status = "queued"
         run.error_message = ""
         run.text = ""
@@ -1929,7 +1944,10 @@ def request_ocr(batch_id: str, background_tasks: BackgroundTasks, replace_questi
         run.started_at = None
         run.completed_at = None
 
-    background_tasks.add_task(run_ocr, batch_id, replace_question)
+    if mode == "ai":
+        background_tasks.add_task(run_direct_ai_ocr, batch_id, user.id, replace_question)
+    else:
+        background_tasks.add_task(run_ocr, batch_id, replace_question)
     return to_ocr_response(run)
 
 
@@ -2151,7 +2169,7 @@ async def create_upload(
                 session.add(batch)
             session.flush()
             for batch_id, _, region_record in upload_records:
-                session.add(OcrRun(batch_id=batch_id))
+                session.add(OcrRun(batch_id=batch_id, engine="AI 视觉识别" if recognition_mode == "ai" else "PaddleOCR PP-OCRv6"))
                 if region_record is not None:
                     session.add(region_record)
     except HTTPException:

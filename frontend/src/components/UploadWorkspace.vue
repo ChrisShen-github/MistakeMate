@@ -14,7 +14,7 @@ const errorMessage = ref('')
 const subject = ref('数学')
 const source = ref('作业')
 const note = ref('')
-const recognitionMode = ref<'local' | 'ai'>('local')
+const recognitionMode = ref<'local' | 'ai'>('ai')
 const aiConfigured = ref(false)
 const canSubmit = computed(() => files.value.length > 0 && !isSubmitting.value && (recognitionMode.value === 'local' || aiConfigured.value))
 

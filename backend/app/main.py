@@ -414,6 +414,7 @@ class PrintTemplateResponse(PrintTemplatePayload):
 
 ocr_model: Any | None = None
 ocr_model_lock = Lock()
+ocr_execution_lock = Lock()
 ocr_model_download_lock = Lock()
 ocr_model_download_cancel = Event()
 ocr_model_download_state: dict[str, Any] = {
@@ -1169,6 +1170,13 @@ def result_to_dict(result: Any) -> dict[str, Any]:
 
 
 def run_ocr(batch_id: str, replace_question: bool = False) -> None:
+    # PaddleOCR is memory-intensive on NAS and low-memory Docker hosts. Keep a
+    # single global worker so simultaneous uploads wait in a safe queue.
+    with ocr_execution_lock:
+        _run_ocr(batch_id, replace_question)
+
+
+def _run_ocr(batch_id: str, replace_question: bool = False) -> None:
     with SessionLocal.begin() as session:
         batch = session.get(UploadBatch, batch_id)
         run = session.get(OcrRun, batch_id)

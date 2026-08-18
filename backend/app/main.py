@@ -1157,7 +1157,7 @@ def parse_crop_regions(value: str, file_count: int) -> list[tuple[float, float, 
 
 
 def parse_merge_groups(value: str, file_count: int) -> list[list[int]]:
-    """Validate adjacent file groups that should become one question."""
+    """Validate image groups that should become one question."""
     try:
         payload = json.loads(value)
     except json.JSONDecodeError as error:
@@ -1167,11 +1167,11 @@ def parse_merge_groups(value: str, file_count: int) -> list[list[int]]:
     if not isinstance(payload, list) or not payload or any(not isinstance(group, list) or not group for group in payload):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="组合图片格式不正确。")
     flattened = [index for group in payload for index in group]
-    if any(not isinstance(index, int) for index in flattened) or flattened != list(range(file_count)):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="组合图片必须按上传顺序且不重复。")
+    if any(not isinstance(index, int) for index in flattened) or sorted(flattened) != list(range(file_count)):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="组合图片必须覆盖全部文件，且不能重复。")
     if any(len(group) > 8 for group in payload):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="同一道题最多组合 8 张图片。")
-    return payload
+    return [sorted(group) for group in sorted(payload, key=lambda group: min(group))]
 
 
 def result_to_dict(result: Any) -> dict[str, Any]:

@@ -1156,6 +1156,24 @@ def parse_crop_regions(value: str, file_count: int) -> list[tuple[float, float, 
     return regions
 
 
+def parse_merge_groups(value: str, file_count: int) -> list[list[int]]:
+    """Validate adjacent file groups that should become one question."""
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="组合图片格式不正确。") from error
+    if payload == []:
+        return [[index] for index in range(file_count)]
+    if not isinstance(payload, list) or not payload or any(not isinstance(group, list) or not group for group in payload):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="组合图片格式不正确。")
+    flattened = [index for group in payload for index in group]
+    if any(not isinstance(index, int) for index in flattened) or flattened != list(range(file_count)):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="组合图片必须按上传顺序且不重复。")
+    if any(len(group) > 8 for group in payload):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="同一道题最多组合 8 张图片。")
+    return payload
+
+
 def result_to_dict(result: Any) -> dict[str, Any]:
     payload = getattr(result, "json", None)
     if callable(payload):
@@ -2092,6 +2110,7 @@ async def create_upload(
     note: str = Form("", max_length=2000),
     recognition_mode: str = Form("local", max_length=16),
     crop_regions: str = Form("[]"),
+    merge_groups: str = Form("[]"),
     files: list[UploadFile] = File(...),
 ) -> UploadResponse:
     if not files:
@@ -2106,17 +2125,25 @@ async def create_upload(
             if config is None or not config.model or not config.encrypted_api_key:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中填写接口地址、视觉模型和 API 密钥。")
     parsed_crop_regions = parse_crop_regions(crop_regions, len(files))
+    parsed_merge_groups = parse_merge_groups(merge_groups, len(files))
 
-    batch_ids: list[str] = []
+    batch_ids = [str(uuid4()) for _ in parsed_merge_groups]
+    batch_by_file_index = {
+        file_index: batch_id
+        for batch_id, group in zip(batch_ids, parsed_merge_groups)
+        for file_index in group
+    }
     batch_directories: list[Path] = []
     upload_records: list[tuple[str, UploadedFile, OcrRegion | None]] = []
 
     try:
-        for file_index, uploaded in enumerate(files):
-            batch_id = str(uuid4())
+        for batch_id in batch_ids:
             batch_directory = storage_root / "uploads" / batch_id
             batch_directory.mkdir(parents=True, exist_ok=False)
             batch_directories.append(batch_directory)
+        for file_index, uploaded in enumerate(files):
+            batch_id = batch_by_file_index[file_index]
+            batch_directory = storage_root / "uploads" / batch_id
             original_name = uploaded.filename or "untitled"
             extension = Path(original_name).suffix.lower()
             content_type = uploaded.content_type or "application/octet-stream"
@@ -2152,11 +2179,10 @@ async def create_upload(
                     width=region[2],
                     height=region[3],
                 )
-            batch_ids.append(batch_id)
             upload_records.append((batch_id, file_record, region_record))
 
         with SessionLocal.begin() as session:
-            for batch_id, file_record, region_record in upload_records:
+            for batch_id in batch_ids:
                 batch = UploadBatch(
                     id=batch_id,
                     owner_id=user.id,
@@ -2164,12 +2190,13 @@ async def create_upload(
                     source=source.strip(),
                     note=note.strip(),
                     status="queued",
-                    files=[file_record],
+                    files=[file_record for saved_batch_id, file_record, _ in upload_records if saved_batch_id == batch_id],
                 )
                 session.add(batch)
             session.flush()
-            for batch_id, _, region_record in upload_records:
+            for batch_id in batch_ids:
                 session.add(OcrRun(batch_id=batch_id, engine="AI 视觉识别" if recognition_mode == "ai" else "PaddleOCR PP-OCRv6"))
+            for _, _, region_record in upload_records:
                 if region_record is not None:
                     session.add(region_record)
     except HTTPException:

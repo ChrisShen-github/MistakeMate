@@ -181,11 +181,11 @@ function figureUrl(question: PrintableQuestion, figureId: string) {
 }
 
 function isCleanOriginal(question: PrintableQuestion) {
-  return question.print_kind === 'clean_image' && Boolean(question.clean_image_file_id)
+  return (question.print_kind === 'clean_image' && Boolean(question.clean_image_file_id)) || (question.is_image_only && Boolean(question.clean_source_file_id))
 }
 
 function cleanImageUrl(question: PrintableQuestion) {
-  return `/api/mistakes/${question.batch_id}/files/${question.clean_image_file_id}/clean-image`
+  return `/api/mistakes/${question.batch_id}/files/${question.clean_image_file_id || question.clean_source_file_id}/clean-image`
 }
 
 function rootParts(question: PrintableQuestion) {
@@ -461,7 +461,7 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
           <article v-for="question in visibleQuestions" :key="question.id" class="question-editor" :class="{ selected: selectedIds.includes(question.id) }">
             <label class="question-check">
               <input type="checkbox" :checked="selectedIds.includes(question.id)" @change="toggleQuestion(question)" />
-              <span><strong>{{ question.subject }} · {{ isCleanOriginal(question) ? '清洁原图' : question.source }}</strong><small>{{ isCleanOriginal(question) ? question.clean_image_name : question.stem }}</small></span>
+              <span><strong>{{ question.subject }} · {{ isCleanOriginal(question) ? '清洁原图' : question.source }}</strong><small>{{ isCleanOriginal(question) ? (question.clean_image_name || '已确认的清洁原图') : question.stem }}</small></span>
             </label>
             <div v-if="selectedIds.includes(question.id)" class="question-tools">
               <div class="tool-row">

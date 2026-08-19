@@ -174,6 +174,8 @@ class MistakeQuestion(Base):
     knowledge_points: Mapped[str] = mapped_column(Text, default="")
     difficulty: Mapped[int] = mapped_column(Integer, default=3)
     error_type: Mapped[str] = mapped_column(String(32), default="")
+    is_image_only: Mapped[bool] = mapped_column(default=False)
+    clean_source_file_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="draft")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
@@ -460,6 +462,8 @@ class MistakeQuestionResponse(BaseModel):
     knowledge_points: str
     difficulty: int
     error_type: str
+    is_image_only: bool = False
+    clean_source_file_id: str | None = None
     parts: list[QuestionPartPayload]
     figures: list[QuestionFigureResponse]
     answer_files: list[QuestionAnswerFileResponse]
@@ -476,6 +480,7 @@ class QuestionUpdateRequest(BaseModel):
     knowledge_points: str = ""
     difficulty: int = 3
     error_type: str = ""
+    is_image_only: bool = False
     parts: list[QuestionPartPayload] = Field(default_factory=list)
     status: str = "draft"
 
@@ -768,6 +773,8 @@ def to_question_response(question: MistakeQuestion) -> MistakeQuestionResponse:
         knowledge_points=question.knowledge_points,
         difficulty=question.difficulty,
         error_type=question.error_type,
+        is_image_only=question.is_image_only,
+        clean_source_file_id=question.clean_source_file_id,
         parts=[to_question_part_payload(part) for part in sorted(question.parts, key=lambda item: item.position)],
         figures=[QuestionFigureResponse(id=figure.id, position=figure.position) for figure in sorted(question.figures, key=lambda item: item.position)],
         answer_files=[
@@ -1626,6 +1633,16 @@ def persist_clean_image(batch_id: str, file_id: str, output: bytes) -> CleanImag
             # A regenerated image needs to be checked again before the batch is treated as confirmed.
             if batch.status == "confirmed":
                 batch.status = "review_ready"
+            existing_question = session.scalar(
+                select(MistakeQuestion).where(
+                    MistakeQuestion.batch_id == batch_id,
+                    MistakeQuestion.is_image_only.is_(True),
+                    MistakeQuestion.clean_source_file_id == file_id,
+                )
+            )
+            if existing_question is not None:
+                existing_question.status = "draft"
+                existing_question.updated_at = datetime.now(timezone.utc)
         if previous_path is not None:
             previous_path.unlink(missing_ok=True)
         return clean_image
@@ -1863,6 +1880,10 @@ def ensure_legacy_columns() -> None:
         ],
         "ai_provider_configs": [("image_edit_model", "VARCHAR(128) NOT NULL DEFAULT ''")],
         "clean_images": [("approved_at", "TIMESTAMP")],
+        "mistake_questions": [
+            ("is_image_only", "BOOLEAN NOT NULL DEFAULT FALSE"),
+            ("clean_source_file_id", "VARCHAR(36)"),
+        ],
     }
     with engine.begin() as connection:
         for table_name, additions in migrations.items():
@@ -1872,6 +1893,7 @@ def ensure_legacy_columns() -> None:
                     connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_upload_batches_owner_id ON upload_batches (owner_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_print_templates_user_id ON print_templates (user_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_mistake_questions_clean_source_file_id ON mistake_questions (clean_source_file_id)"))
 
 
 @asynccontextmanager
@@ -2156,6 +2178,10 @@ def list_mistakes(subject: str | None = None, user: AppUser = Depends(require_us
 
 @app.get("/api/print/questions", response_model=list[PrintableQuestionResponse])
 def list_printable_questions(subject: str | None = None, user: AppUser = Depends(require_user)) -> list[PrintableQuestionResponse]:
+    with SessionLocal.begin() as session:
+        batches = session.scalars(select(UploadBatch).where(UploadBatch.owner_id == user.id)).all()
+        for batch in batches:
+            ensure_clean_image_questions(session, batch)
     statement = (
         select(MistakeQuestion, UploadBatch)
         .join(UploadBatch, MistakeQuestion.batch_id == UploadBatch.id)
@@ -2187,6 +2213,12 @@ def list_printable_questions(subject: str | None = None, user: AppUser = Depends
         if subject:
             clean_statement = clean_statement.where(UploadBatch.subject == subject)
         clean_rows = session.execute(clean_statement).all()
+        existing_clean_sources = set(session.scalars(
+            select(MistakeQuestion.clean_source_file_id).where(
+                MistakeQuestion.is_image_only.is_(True),
+                MistakeQuestion.clean_source_file_id.is_not(None),
+            )
+        ).all())
         clean_questions = [
             PrintableQuestionResponse(
                 id=f"clean-{file.id}",
@@ -2213,6 +2245,7 @@ def list_printable_questions(subject: str | None = None, user: AppUser = Depends
                 clean_image_name=file.original_name,
             )
             for index, (batch, file, clean_image) in enumerate(clean_rows)
+            if file.id not in existing_clean_sources
         ]
         return [*text_questions, *clean_questions]
 
@@ -2282,8 +2315,44 @@ def delete_print_template(template_id: str, user: AppUser = Depends(require_user
     return {"status": "deleted"}
 
 
+def ensure_clean_image_questions(session: Any, batch: UploadBatch) -> None:
+    """Give each approved clean image a normal question record for learning metadata."""
+    approved_file_ids = session.scalars(
+        select(CleanImage.source_file_id).where(CleanImage.batch_id == batch.id, CleanImage.approved_at.is_not(None))
+    ).all()
+    if not approved_file_ids:
+        return
+    existing_questions = {
+        question.clean_source_file_id: question
+        for question in session.scalars(
+            select(MistakeQuestion).where(
+            MistakeQuestion.batch_id == batch.id,
+            MistakeQuestion.is_image_only.is_(True),
+            MistakeQuestion.clean_source_file_id.is_not(None),
+            )
+        ).all()
+    }
+    next_position = max((question.position for question in batch.questions), default=0)
+    for file in sorted(batch.files, key=lambda item: item.original_name):
+        if file.id not in approved_file_ids:
+            continue
+        existing_question = existing_questions.get(file.id)
+        if existing_question is not None:
+            existing_question.status = "confirmed"
+            existing_question.updated_at = datetime.now(timezone.utc)
+            continue
+        next_position += 1
+        session.add(MistakeQuestion(
+            id=str(uuid4()), batch_id=batch.id, position=next_position, question_type="其他", stem="",
+            is_image_only=True, clean_source_file_id=file.id, status="confirmed",
+        ))
+
+
 @app.get("/api/mistakes/{batch_id}", response_model=MistakeBatchDetailResponse)
 def get_mistake_batch(batch_id: str, user: AppUser = Depends(require_user)) -> MistakeBatchDetailResponse:
+    with SessionLocal.begin() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        ensure_clean_image_questions(session, batch)
     with SessionLocal() as session:
         batch = get_owned_batch(session, batch_id, user.id)
         files = list(batch.files)
@@ -2385,6 +2454,7 @@ def approve_clean_image(batch_id: str, file_id: str, user: AppUser = Depends(req
             batch.status = "confirmed"
         else:
             batch.status = "review_ready"
+        ensure_clean_image_questions(session, batch)
     return to_uploaded_file_response(file, clean_image)
 
 
@@ -2397,6 +2467,16 @@ def delete_clean_image(batch_id: str, file_id: str, user: AppUser = Depends(requ
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="这张原图还没有清洁打印图。")
         path = storage_root / "uploads" / batch_id / "clean" / clean_image.stored_name
         session.delete(clean_image)
+        image_question = session.scalar(
+            select(MistakeQuestion).where(
+                MistakeQuestion.batch_id == batch_id,
+                MistakeQuestion.is_image_only.is_(True),
+                MistakeQuestion.clean_source_file_id == file_id,
+            )
+        )
+        if image_question is not None:
+            image_question.status = "draft"
+            image_question.updated_at = datetime.now(timezone.utc)
         if batch.status == "confirmed":
             batch.status = "review_ready"
     path.unlink(missing_ok=True)
@@ -2804,7 +2884,7 @@ def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUp
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="题型不正确。")
     if payload.status not in {"draft", "confirmed"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="确认状态不正确。")
-    if not payload.stem.strip():
+    if not payload.is_image_only and not payload.stem.strip():
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请补充题干后再保存。")
     if not 1 <= payload.difficulty <= 5:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="难度应在 1 到 5 星之间。")
@@ -2832,6 +2912,7 @@ def update_mistake_question(batch_id: str, question_id: str, payload: QuestionUp
         question.knowledge_points = payload.knowledge_points.strip()[:1000]
         question.difficulty = payload.difficulty
         question.error_type = payload.error_type.strip()[:32]
+        question.is_image_only = payload.is_image_only
         save_question_parts(session, question, payload.parts)
         question.status = payload.status
         question.updated_at = datetime.now(timezone.utc)

@@ -29,6 +29,8 @@ export type MistakeQuestion = {
   knowledge_points: string
   difficulty: number
   error_type: string
+  is_image_only: boolean
+  clean_source_file_id: string | null
   parts: QuestionPart[]
   figures: QuestionFigure[]
   answer_files: QuestionAnswerFile[]

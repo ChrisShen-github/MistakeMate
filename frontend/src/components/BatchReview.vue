@@ -130,6 +130,7 @@ async function approveCleanImage(file: UploadedFile) {
     replaceFile(payload)
     if (compareFile.value?.id === file.id) compareFile.value = payload
     if (batch.value && imageFiles.value.every((item) => item.id === file.id ? Boolean(payload.clean_image?.approved_at) : Boolean(item.clean_image?.approved_at))) batch.value.status = 'confirmed'
+    await loadBatch()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '确认清洁图失败，请稍后重试。'
   } finally {
@@ -319,6 +320,9 @@ onBeforeUnmount(clearRefreshTimer)
         <QuestionEditor v-for="question in batch.questions" :key="question.id" :batch-id="batch.id" :question="question" :can-add-figure="imageFiles.length > 0" :can-auto-extract-figure="aiConfigured" @saved="updateQuestion" @finished="emit('back')" @add-figure="startFigureCapture(question.id)" @auto-extract-figure="startFigureCapture(question.id, 'ai')" @remove-figure="removeFigure(question.id, $event)" />
         <section v-if="!batch.questions.length" class="ocr-result" aria-labelledby="ocr-result-heading"><div class="section-heading"><div><p class="eyebrow">OCR 初稿</p><h2 id="ocr-result-heading">识别出的文字</h2></div><span>{{ batch.ocr.engine }}</span></div><p class="empty-draft">正在生成可编辑题目，请稍后刷新。</p></section>
         <details class="ocr-raw"><summary>查看{{ recognitionName(batch.ocr) }}原始文字</summary><pre>{{ batch.ocr.text || '没有识别出可编辑文字，请检查图片清晰度后重试。' }}</pre></details>
+      </template>
+      <template v-if="batch.ocr?.status === 'completed' && isCleanWorkflow(batch.ocr)">
+        <QuestionEditor v-for="question in batch.questions" :key="question.id" :batch-id="batch.id" :question="question" @saved="updateQuestion" @finished="emit('back')" />
       </template>
       <section v-else-if="batch.ocr?.status === 'failed'" class="ocr-failed" role="alert"><CircleAlert :size="19" /><div><strong>{{ recognitionName(batch.ocr) }}未完成</strong><p>{{ batch.ocr.error_message || '请检查识别设置、网络和文件格式后重试。' }}</p></div><button type="button" @click="startOcr(false)"><RefreshCw :size="16" />重试</button></section>
 

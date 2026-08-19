@@ -81,6 +81,16 @@ class AppUser(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class UserPreference(Base):
+    __tablename__ = "user_preferences"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("app_users.id"), primary_key=True)
+    default_upload_workflow: Mapped[str] = mapped_column(String(32), default="ask")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+
 class UploadBatch(Base):
     __tablename__ = "upload_batches"
 
@@ -294,6 +304,15 @@ class PasswordChangeRequest(BaseModel):
 class PasswordChangeResponse(BaseModel):
     status: str
     message: str
+
+
+class PreferenceResponse(BaseModel):
+    default_upload_workflow: str
+    updated_at: datetime | None
+
+
+class PreferenceUpdateRequest(BaseModel):
+    default_upload_workflow: str = Field(pattern="^(ask|text|clean)$")
 
 
 class AuthBootstrapResponse(BaseModel):
@@ -1536,6 +1555,36 @@ def call_ai_image_edit(config: AiProviderConfig, source_path: Path) -> bytes:
     return output
 
 
+def persist_clean_image(batch_id: str, file_id: str, output: bytes) -> CleanImage:
+    clean_directory = storage_root / "uploads" / batch_id / "clean"
+    clean_directory.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{uuid4()}.png"
+    output_path = clean_directory / stored_name
+    try:
+        output_path.write_bytes(output)
+    except OSError as error:
+        raise RuntimeError("清洁图写入失败，请检查数据目录是否可写。") from error
+
+    previous_path: Path | None = None
+    try:
+        with SessionLocal.begin() as session:
+            file = session.get(UploadedFile, file_id)
+            if file is None or file.batch_id != batch_id:
+                raise RuntimeError("原始文件已不存在，无法保存清洁图。")
+            existing = session.get(CleanImage, file_id)
+            if existing is not None:
+                previous_path = clean_directory / existing.stored_name
+                session.delete(existing)
+            clean_image = CleanImage(source_file_id=file.id, batch_id=batch_id, stored_name=stored_name)
+            session.add(clean_image)
+        if previous_path is not None:
+            previous_path.unlink(missing_ok=True)
+        return clean_image
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+
+
 def build_ai_ocr_messages(batch_id: str, local_ocr_text: str) -> list[dict[str, Any]]:
     prompt = (
         "请复核这些试题图片，并结合下面的本地 OCR 初稿，输出完整、可编辑的题面文字。"
@@ -1704,6 +1753,52 @@ def run_direct_ai_ocr(batch_id: str, user_id: str, replace_question: bool = Fals
             run.completed_at = datetime.now(timezone.utc)
 
 
+def run_clean_image_workflow(batch_id: str, user_id: str) -> None:
+    with SessionLocal.begin() as session:
+        batch = session.get(UploadBatch, batch_id)
+        run = session.get(OcrRun, batch_id)
+        config = session.get(AiProviderConfig, user_id)
+        if batch is None or run is None or config is None or not config.image_edit_model or not config.encrypted_api_key:
+            return
+        batch.status = "recognizing"
+        run.status = "running"
+        run.engine = "清洁原图"
+        run.error_message = ""
+        run.text = ""
+        run.started_at = datetime.now(timezone.utc)
+        run.completed_at = None
+        files = [
+            (file.id, storage_root / "uploads" / batch_id / file.stored_name)
+            for file in batch.files
+            if file.content_type.startswith("image/") or Path(file.original_name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+        ]
+        session.expunge(config)
+    try:
+        for file_id, source_path in files:
+            if not source_path.is_file():
+                raise RuntimeError("原始图片已不存在，无法去除笔迹。")
+            persist_clean_image(batch_id, file_id, call_ai_image_edit(config, source_path))
+        with SessionLocal.begin() as session:
+            batch = session.get(UploadBatch, batch_id)
+            run = session.get(OcrRun, batch_id)
+            if batch is None or run is None:
+                return
+            batch.status = "review_ready"
+            run.status = "completed"
+            run.text = ""
+            run.completed_at = datetime.now(timezone.utc)
+    except Exception as error:
+        with SessionLocal.begin() as session:
+            batch = session.get(UploadBatch, batch_id)
+            run = session.get(OcrRun, batch_id)
+            if batch is None or run is None:
+                return
+            batch.status = "ocr_failed"
+            run.status = "failed"
+            run.error_message = str(error)[:2000]
+            run.completed_at = datetime.now(timezone.utc)
+
+
 def ensure_legacy_columns() -> None:
     schema = inspect(engine)
     migrations = {
@@ -1820,6 +1915,33 @@ def logout_user(response: Response) -> dict[str, str]:
 @app.get("/api/auth/me", response_model=UserResponse)
 def current_user(user: AppUser = Depends(require_user)) -> UserResponse:
     return to_user_response(user)
+
+
+def to_preference_response(preference: UserPreference | None) -> PreferenceResponse:
+    if preference is None:
+        return PreferenceResponse(default_upload_workflow="ask", updated_at=None)
+    return PreferenceResponse(
+        default_upload_workflow=preference.default_upload_workflow,
+        updated_at=preference.updated_at,
+    )
+
+
+@app.get("/api/settings/preferences", response_model=PreferenceResponse)
+def get_preferences(user: AppUser = Depends(require_user)) -> PreferenceResponse:
+    with SessionLocal() as session:
+        return to_preference_response(session.get(UserPreference, user.id))
+
+
+@app.put("/api/settings/preferences", response_model=PreferenceResponse)
+def save_preferences(payload: PreferenceUpdateRequest, user: AppUser = Depends(require_user)) -> PreferenceResponse:
+    with SessionLocal.begin() as session:
+        preference = session.get(UserPreference, user.id)
+        if preference is None:
+            preference = UserPreference(user_id=user.id)
+            session.add(preference)
+        preference.default_upload_workflow = payload.default_upload_workflow
+        preference.updated_at = datetime.now(timezone.utc)
+    return to_preference_response(preference)
 
 
 @app.put("/api/auth/profile", response_model=UserResponse)
@@ -2137,32 +2259,11 @@ def create_clean_image(batch_id: str, file_id: str, user: AppUser = Depends(requ
     except RuntimeError as error:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
 
-    clean_directory = storage_root / "uploads" / batch_id / "clean"
-    clean_directory.mkdir(parents=True, exist_ok=True)
-    stored_name = f"{uuid4()}.png"
-    output_path = clean_directory / stored_name
     try:
-        output_path.write_bytes(output)
-    except OSError as error:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="清洁图写入失败，请检查数据目录是否可写。") from error
-
-    previous_path: Path | None = None
-    try:
-        with SessionLocal.begin() as session:
-            file = session.get(UploadedFile, file_id)
-            if file is None or file.batch_id != batch_id:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到原始文件。")
-            existing = session.get(CleanImage, file_id)
-            if existing is not None:
-                previous_path = clean_directory / existing.stored_name
-                session.delete(existing)
-            clean_image = CleanImage(source_file_id=file.id, batch_id=batch_id, stored_name=stored_name)
-            session.add(clean_image)
-        previous_path and previous_path.unlink(missing_ok=True)
-        return to_uploaded_file_response(file, clean_image)
-    except Exception:
-        output_path.unlink(missing_ok=True)
-        raise
+        clean_image = persist_clean_image(batch_id, file_id, output)
+    except RuntimeError as error:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(error)) from error
+    return to_uploaded_file_response(file, clean_image)
 
 
 @app.get("/api/mistakes/{batch_id}/files/{file_id}/clean-image")
@@ -2557,6 +2658,7 @@ async def create_upload(
     subject: str = Form(..., min_length=1, max_length=32),
     source: str = Form(..., min_length=1, max_length=32),
     note: str = Form("", max_length=2000),
+    workflow: str = Form("text", max_length=16),
     recognition_mode: str = Form("local", max_length=16),
     crop_regions: str = Form("[]"),
     merge_groups: str = Form("[]"),
@@ -2566,9 +2668,19 @@ async def create_upload(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请至少上传一个文件。")
     if len(files) > MAX_FILES_PER_BATCH:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"一次最多上传 {MAX_FILES_PER_BATCH} 个文件。")
+    if workflow not in {"text", "clean"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="上传流程不正确。")
     if recognition_mode not in {"local", "ai"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="识别方式不正确。")
-    if recognition_mode == "ai":
+    if workflow == "clean":
+        image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+        if any(Path(uploaded.filename or "").suffix.lower() not in image_extensions for uploaded in files):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="清洁原图流程暂不支持 PDF，请改为上传图片。")
+        with SessionLocal() as session:
+            config = session.get(AiProviderConfig, user.id)
+            if config is None or not config.image_edit_model or not config.encrypted_api_key:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中选择图片修复模型并保存 API 密钥。")
+    elif recognition_mode == "ai":
         with SessionLocal() as session:
             config = session.get(AiProviderConfig, user.id)
             if config is None or not config.model or not config.encrypted_api_key:
@@ -2644,7 +2756,8 @@ async def create_upload(
                 session.add(batch)
             session.flush()
             for batch_id in batch_ids:
-                session.add(OcrRun(batch_id=batch_id, engine="AI 视觉识别" if recognition_mode == "ai" else "PaddleOCR PP-OCRv6"))
+                engine = "清洁原图" if workflow == "clean" else ("AI 视觉识别" if recognition_mode == "ai" else "PaddleOCR PP-OCRv6")
+                session.add(OcrRun(batch_id=batch_id, engine=engine))
             for _, _, region_record in upload_records:
                 if region_record is not None:
                     session.add(region_record)
@@ -2658,7 +2771,9 @@ async def create_upload(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="文件保存失败，请稍后重试。") from error
 
     for batch_id in batch_ids:
-        if recognition_mode == "ai":
+        if workflow == "clean":
+            background_tasks.add_task(run_clean_image_workflow, batch_id, user.id)
+        elif recognition_mode == "ai":
             background_tasks.add_task(run_direct_ai_ocr, batch_id, user.id)
         else:
             background_tasks.add_task(run_ocr, batch_id)

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { ArrowLeft, CheckCircle2, Crop, FileImage, FileText, ImagePlus, Link2, LoaderCircle, LockKeyhole, ScanText, Sparkles, Trash2, Unlink, UploadCloud } from '@lucide/vue'
+import { ArrowLeft, CheckCircle2, Crop, Eraser, FileImage, FileText, ImagePlus, Link2, LoaderCircle, LockKeyhole, ScanText, Sparkles, Trash2, Unlink, UploadCloud } from '@lucide/vue'
 import ImageCropper, { type CropRegion } from './ImageCropper.vue'
 
 const props = defineProps<{ notebookName: string }>()
@@ -18,9 +18,12 @@ const errorMessage = ref('')
 const subject = ref('数学')
 const source = ref('作业')
 const note = ref('')
+const workflow = ref<'text' | 'clean'>('text')
 const recognitionMode = ref<'local' | 'ai'>('ai')
 const aiConfigured = ref(false)
-const canSubmit = computed(() => files.value.length > 0 && !isSubmitting.value && (recognitionMode.value === 'local' || aiConfigured.value))
+const cleanConfigured = ref(false)
+const defaultWorkflow = ref<'ask' | 'text' | 'clean'>('ask')
+const canSubmit = computed(() => files.value.length > 0 && !isSubmitting.value && (workflow.value === 'clean' ? cleanConfigured.value : recognitionMode.value === 'local' || aiConfigured.value))
 const uploadGroups = computed(() => {
   const included = new Set<number>()
   const groups = mergedGroups.value
@@ -100,12 +103,20 @@ function openCrop(index: number) { activeCropIndex.value = index }
 function saveCrop(region: CropRegion | null) { if (activeCropIndex.value !== null) cropRegions.value[activeCropIndex.value] = region; activeCropIndex.value = null }
 function formatSize(size: number) { return size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / 1024 / 1024).toFixed(1)} MB` }
 function selectRecognitionMode(mode: 'local' | 'ai') { recognitionMode.value = mode; errorMessage.value = '' }
+function selectWorkflow(value: 'text' | 'clean') { workflow.value = value; errorMessage.value = '' }
 async function loadAiAvailability() {
   try {
-    const response = await fetch('/api/settings/ai')
-    if (!response.ok) return
-    const payload = await response.json()
-    aiConfigured.value = Boolean(payload.model && payload.api_key_configured)
+    const [aiResponse, preferenceResponse] = await Promise.all([fetch('/api/settings/ai'), fetch('/api/settings/preferences')])
+    if (aiResponse.ok) {
+      const payload = await aiResponse.json()
+      aiConfigured.value = Boolean(payload.model && payload.api_key_configured)
+      cleanConfigured.value = Boolean(payload.image_edit_model && payload.api_key_configured)
+    }
+    if (preferenceResponse.ok) {
+      const payload = await preferenceResponse.json()
+      defaultWorkflow.value = payload.default_upload_workflow
+      if (payload.default_upload_workflow === 'text' || payload.default_upload_workflow === 'clean') workflow.value = payload.default_upload_workflow
+    }
   } catch { /* The backend validates again when the upload starts. */ }
 }
 async function queueRecognition() {
@@ -116,6 +127,7 @@ async function queueRecognition() {
   formData.set('subject', subject.value)
   formData.set('source', source.value)
   formData.set('note', note.value.trim())
+  formData.set('workflow', workflow.value)
   formData.set('recognition_mode', recognitionMode.value)
   formData.set('crop_regions', JSON.stringify(cropRegions.value))
   formData.set('merge_groups', JSON.stringify(uploadGroups.value))
@@ -172,11 +184,11 @@ onMounted(loadAiAvailability)
         </div>
       </section>
       <aside class="details-column">
-        <section class="details-card" aria-labelledby="details-heading"><div class="section-title"><div><p class="section-kicker">第二步</p><h2 id="details-heading">补充一点信息</h2></div></div><p class="details-tip">这能让 AI 更准确地判断知识点。其余信息可在识别后再修改。</p><div class="form-grid"><label>学科<select v-model="subject"><option>数学</option><option>语文</option><option>英语</option><option>其他</option></select></label><label>题目来源<select v-model="source"><option>作业</option><option>试卷</option><option>练习册</option><option>其他</option></select></label></div><label class="note-label">给自己留个备注 <span>可选</span><textarea v-model="note" placeholder="例如：第 2 单元周测，孩子说这题当时没看懂。"></textarea></label><fieldset class="recognition-mode"><legend>识别方式</legend><button type="button" class="mode-choice" :class="{ active: recognitionMode === 'local' }" :aria-pressed="recognitionMode === 'local'" @click="selectRecognitionMode('local')"><ScanText :size="18" /><span><strong>本地 OCR</strong><small>免费、题图不离开设备</small></span></button><button type="button" class="mode-choice" :class="{ active: recognitionMode === 'ai' }" :aria-pressed="recognitionMode === 'ai'" @click="selectRecognitionMode('ai')"><Sparkles :size="18" /><span><strong>AI 视觉识别</strong><small>{{ aiConfigured ? '跳过本地 OCR，直接使用视觉模型' : '需要先完成 AI 设置' }}</small></span></button><p v-if="recognitionMode === 'ai'" class="mode-tip" :class="{ warning: !aiConfigured }">{{ aiConfigured ? '图片会发送给你配置的 AI 服务，适合手写、公式和复杂版面。' : '尚未配置视觉模型，请先完成 AI 设置后再上传。' }}<button v-if="!aiConfigured" type="button" @click="emit('configure-ai')">去配置 AI</button></p></fieldset></section>
+        <section class="details-card" aria-labelledby="details-heading"><div class="section-title"><div><p class="section-kicker">第二步</p><h2 id="details-heading">补充一点信息</h2></div></div><p class="details-tip">这能让 AI 更准确地判断知识点。其余信息可在识别后再修改。</p><div class="form-grid"><label>学科<select v-model="subject"><option>数学</option><option>语文</option><option>英语</option><option>其他</option></select></label><label>题目来源<select v-model="source"><option>作业</option><option>试卷</option><option>练习册</option><option>其他</option></select></label></div><label class="note-label">给自己留个备注 <span>可选</span><textarea v-model="note" placeholder="例如：第 2 单元周测，孩子说这题当时没看懂。"></textarea></label><fieldset class="recognition-mode"><legend>本次处理流程 <small v-if="defaultWorkflow !== 'ask'">已按偏好带入</small></legend><button type="button" class="mode-choice" :class="{ active: workflow === 'text' }" :aria-pressed="workflow === 'text'" @click="selectWorkflow('text')"><FileText :size="18" /><span><strong>识别为可编辑题目</strong><small>适合知识点分类、编辑题干、组卷和针对性练习</small></span></button><button type="button" class="mode-choice clean-choice" :class="{ active: workflow === 'clean' }" :aria-pressed="workflow === 'clean'" @click="selectWorkflow('clean')"><Eraser :size="18" /><span><strong>去除笔迹，保留原题</strong><small>生成清洁打印图，保留图表、公式与原始排版</small></span></button><p v-if="workflow === 'clean'" class="mode-tip" :class="{ warning: !cleanConfigured }">{{ cleanConfigured ? '将调用图片修复模型生成清洁图；这次不会生成可编辑文字，之后仍可手动发起文字识别。' : '尚未配置图片修复模型，请先在 AI 设置中选择 image 模型。' }}<button v-if="!cleanConfigured" type="button" @click="emit('configure-ai')">去配置 AI</button></p></fieldset><fieldset v-if="workflow === 'text'" class="recognition-mode nested"><legend>文字识别方式</legend><button type="button" class="mode-choice" :class="{ active: recognitionMode === 'local' }" :aria-pressed="recognitionMode === 'local'" @click="selectRecognitionMode('local')"><ScanText :size="18" /><span><strong>本地 OCR</strong><small>免费、题图不离开设备</small></span></button><button type="button" class="mode-choice" :class="{ active: recognitionMode === 'ai' }" :aria-pressed="recognitionMode === 'ai'" @click="selectRecognitionMode('ai')"><Sparkles :size="18" /><span><strong>AI 视觉识别</strong><small>{{ aiConfigured ? '跳过本地 OCR，直接使用视觉模型' : '需要先完成 AI 设置' }}</small></span></button><p v-if="recognitionMode === 'ai'" class="mode-tip" :class="{ warning: !aiConfigured }">{{ aiConfigured ? '图片会发送给你配置的 AI 服务，适合手写、公式和复杂版面。' : '尚未配置视觉模型，请先完成 AI 设置后再上传。' }}<button v-if="!aiConfigured" type="button" @click="emit('configure-ai')">去配置 AI</button></p></fieldset></section>
         <section class="privacy-note"><LockKeyhole :size="19" /><div><strong>题目只用于生成你的错题本</strong><p>原图会保留，AI 识别结果可随时修改或删除。</p></div></section>
       </aside>
     </div>
-    <footer class="upload-footer"><p><CheckCircle2 :size="17" />将由 {{ files.length }} 张图片生成 {{ questionCount }} 道题；合并的图片会一起识别并确认。</p><button class="recognize-button" type="button" :disabled="!canSubmit" @click="queueRecognition"><LoaderCircle v-if="isSubmitting" class="spin" :size="18" />{{ isSubmitting ? '正在上传…' : recognitionMode === 'ai' ? (aiConfigured ? `使用 AI 识别 ${questionCount} 道题` : '请先配置 AI') : `生成 ${questionCount} 道题并识别` }}</button></footer>
+    <footer class="upload-footer"><p><CheckCircle2 :size="17" />{{ workflow === 'clean' ? `将为 ${files.length} 张图片生成清洁打印图，原图会保留。` : `将由 ${files.length} 张图片生成 ${questionCount} 道题；合并的图片会一起识别并确认。` }}</p><button class="recognize-button" type="button" :disabled="!canSubmit" @click="queueRecognition"><LoaderCircle v-if="isSubmitting" class="spin" :size="18" />{{ isSubmitting ? '正在上传…' : workflow === 'clean' ? (cleanConfigured ? `去除 ${files.length} 张图的笔迹` : '请先配置图片修复模型') : recognitionMode === 'ai' ? (aiConfigured ? `使用 AI 识别 ${questionCount} 道题` : '请先配置 AI') : `生成 ${questionCount} 道题并识别` }}</button></footer>
     <ImageCropper v-if="activeCropIndex !== null && files[activeCropIndex]" :key="`${files[activeCropIndex].name}-${activeCropIndex}`" :file="files[activeCropIndex]" :initial-region="cropRegions[activeCropIndex]" @cancel="activeCropIndex = null" @confirm="saveCrop" />
   </section>
 </template>

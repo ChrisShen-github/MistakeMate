@@ -15,6 +15,7 @@ import {
   MoreHorizontal,
   Printer,
   ScanText,
+  SlidersHorizontal,
   Sparkles,
   Star,
   Target,
@@ -29,6 +30,7 @@ import AuthWorkspace, { type SignedInUser } from './components/AuthWorkspace.vue
 import SettingsWorkspace from './components/SettingsWorkspace.vue'
 import AiSettingsWorkspace from './components/AiSettingsWorkspace.vue'
 import OcrModelSettingsWorkspace from './components/OcrModelSettingsWorkspace.vue'
+import PreferencesWorkspace from './components/PreferencesWorkspace.vue'
 
 type NavItem = {
   label: string
@@ -43,7 +45,7 @@ const navigation: NavItem[] = [
 ]
 
 const activeNav = ref('今日任务')
-type AppView = 'dashboard' | 'upload' | 'library' | 'review' | 'print' | 'settings' | 'ai-settings' | 'ocr-models'
+type AppView = 'dashboard' | 'upload' | 'library' | 'review' | 'print' | 'settings' | 'ai-settings' | 'ocr-models' | 'preferences'
 const currentView = ref<AppView>('dashboard')
 const settingsReturnView = ref<AppView>('dashboard')
 const previousView = ref<'dashboard' | 'library'>('dashboard')
@@ -68,7 +70,7 @@ const subjects = [
 ]
 
 const activeTitle = computed(() => activeNav.value === '今日任务' ? '今天，先攻克最值得重做的题。' : activeNav.value)
-const currentCrumb = computed(() => currentView.value === 'upload' ? '上传错题' : currentView.value === 'library' ? '我的错题' : currentView.value === 'review' ? '检查错题' : currentView.value === 'print' ? '错题集打印' : currentView.value === 'settings' ? '账户设置' : currentView.value === 'ai-settings' ? 'AI 设置' : currentView.value === 'ocr-models' ? 'OCR 模型' : activeNav.value)
+const currentCrumb = computed(() => currentView.value === 'upload' ? '上传错题' : currentView.value === 'library' ? '我的错题' : currentView.value === 'review' ? '检查错题' : currentView.value === 'print' ? '错题集打印' : currentView.value === 'settings' ? '账户设置' : currentView.value === 'ai-settings' ? 'AI 设置' : currentView.value === 'ocr-models' ? 'OCR 模型' : currentView.value === 'preferences' ? '偏好设置' : activeNav.value)
 const displayInitial = computed(() => currentUser.value?.display_name.slice(0, 1) || 'M')
 
 function showNotice(message: string) {
@@ -138,7 +140,7 @@ function startReview() {
 function onRecognitionQueued(count: number) {
   activeNav.value = '我的错题'
   currentView.value = 'library'
-  showNotice(`已创建 ${count} 道待确认题目，正在依次识别。`)
+  showNotice(`已创建 ${count} 组待处理错题，正在按所选流程处理。`)
 }
 
 function onAuthenticated(user: SignedInUser) {
@@ -152,25 +154,31 @@ function onProfileUpdated(user: SignedInUser) {
 }
 
 function openSettings() {
-  if (!['settings', 'ai-settings', 'ocr-models'].includes(currentView.value)) settingsReturnView.value = currentView.value
+  if (!['settings', 'ai-settings', 'ocr-models', 'preferences'].includes(currentView.value)) settingsReturnView.value = currentView.value
   currentView.value = 'settings'
   sidebarOpen.value = false
 }
 
 function openAiSettings() {
-  if (!['settings', 'ai-settings', 'ocr-models'].includes(currentView.value)) settingsReturnView.value = currentView.value
+  if (!['settings', 'ai-settings', 'ocr-models', 'preferences'].includes(currentView.value)) settingsReturnView.value = currentView.value
   currentView.value = 'ai-settings'
   sidebarOpen.value = false
 }
 
 function openOcrModels() {
-  if (!['settings', 'ai-settings', 'ocr-models'].includes(currentView.value)) settingsReturnView.value = currentView.value
+  if (!['settings', 'ai-settings', 'ocr-models', 'preferences'].includes(currentView.value)) settingsReturnView.value = currentView.value
   currentView.value = 'ocr-models'
   sidebarOpen.value = false
 }
 
+function openPreferences() {
+  if (!['settings', 'ai-settings', 'ocr-models', 'preferences'].includes(currentView.value)) settingsReturnView.value = currentView.value
+  currentView.value = 'preferences'
+  sidebarOpen.value = false
+}
+
 function closeSettings() {
-  currentView.value = ['settings', 'ai-settings', 'ocr-models'].includes(settingsReturnView.value) ? 'dashboard' : settingsReturnView.value
+  currentView.value = ['settings', 'ai-settings', 'ocr-models', 'preferences'].includes(settingsReturnView.value) ? 'dashboard' : settingsReturnView.value
 }
 
 async function logout() {
@@ -223,6 +231,7 @@ onMounted(async () => {
       <div class="sidebar-bottom">
         <button class="nav-item muted" :class="{ active: currentView === 'ocr-models' }" @click="openOcrModels"><ScanText :size="19" />OCR 模型</button>
         <button class="nav-item muted" :class="{ active: currentView === 'ai-settings' }" @click="openAiSettings"><Sparkles :size="19" />AI 设置</button>
+        <button class="nav-item muted" :class="{ active: currentView === 'preferences' }" @click="openPreferences"><SlidersHorizontal :size="19" />偏好设置</button>
         <button class="nav-item muted" @click="showNotice('帮助中心将在正式版开放。')"><CircleHelp :size="19" />使用帮助</button>
         <div class="child-switcher">
           <div class="avatar">{{ displayInitial }}</div>
@@ -251,6 +260,7 @@ onMounted(async () => {
       <SettingsWorkspace v-else-if="currentView === 'settings'" :user="currentUser" @back="closeSettings" @logout="logout" @profile-updated="onProfileUpdated" />
       <AiSettingsWorkspace v-else-if="currentView === 'ai-settings'" @back="closeSettings" />
       <OcrModelSettingsWorkspace v-else-if="currentView === 'ocr-models'" @back="closeSettings" />
+      <PreferencesWorkspace v-else-if="currentView === 'preferences'" @back="closeSettings" />
 
       <section v-else class="dashboard">
         <div class="welcome-row">

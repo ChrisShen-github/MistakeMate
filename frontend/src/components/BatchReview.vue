@@ -135,6 +135,7 @@ function startFigureCapture(questionId: string, mode: 'manual' | 'ai' = 'manual'
   figureCropFile.value = null
   figureCaptureMode.value = mode
   errorMessage.value = ''
+  if (mode === 'ai' && imageFiles.value.length === 1) void autoExtractFigure(imageFiles.value[0])
 }
 
 function clearFigureCapture() {

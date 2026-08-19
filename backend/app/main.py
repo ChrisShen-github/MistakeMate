@@ -1488,7 +1488,7 @@ def build_ai_figure_messages(batch_id: str, file: UploadedFile) -> list[dict[str
         "请从这张试题原图中定位需要保留的题图，例如坐标轴、数轴、几何图、统计图、函数图、示意图或表格。"
         "只返回严格 JSON，不要 Markdown、解释或代码块，格式为："
         '{"figures":[{"x":0.10,"y":0.35,"width":0.70,"height":0.25}]}。'
-        "x、y、width、height 必须是相对原图左上角的 0 到 1 小数；裁切范围应包含图形本身及必要刻度、标签和题图内文字，"
+        "x、y、width、height 必须是相对原图左上角的 0 到 1 小数；裁切范围应包含图形本身及必要刻度、标签和题图内文字，图形下方要额外留出一些空间，"
         "不要包含题干段落、孩子的手写笔记、勾画、答案或大面积空白。没有需要保留的题图时返回 {\"figures\":[]}。"
     )
     source = storage_root / "uploads" / batch_id / file.stored_name
@@ -2032,6 +2032,19 @@ def parse_ai_figure_regions(content: str) -> list[tuple[float, float, float, flo
     return regions
 
 
+def add_ai_figure_padding(region: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    x, y, width, height = region
+    horizontal_padding = min(.04, width * .2)
+    top_padding = min(.05, height * .25)
+    # 题图的横轴标签、图例和最后一行数据常位于模型框选边缘之外，底部多保留一些缓冲区。
+    bottom_padding = min(.10, height * .5)
+    left = max(0, x - horizontal_padding)
+    top = max(0, y - top_padding)
+    right = min(1, x + width + horizontal_padding)
+    bottom = min(1, y + height + bottom_padding)
+    return left, top, right - left, bottom - top
+
+
 def strip_ai_figure_description(stem: str) -> str:
     start = stem.find("【题图需保留】")
     if start < 0:
@@ -2129,7 +2142,7 @@ def auto_extract_question_figures(batch_id: str, question_id: str, payload: Ques
         session.expunge(config)
         session.expunge(file)
     try:
-        regions = parse_ai_figure_regions(call_ai_chat(config, build_ai_figure_messages(batch_id, file), max_tokens=800))
+        regions = [add_ai_figure_padding(region) for region in parse_ai_figure_regions(call_ai_chat(config, build_ai_figure_messages(batch_id, file), max_tokens=800))]
     except RuntimeError as error:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
     if not regions:

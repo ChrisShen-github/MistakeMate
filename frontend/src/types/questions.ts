@@ -1,5 +1,6 @@
 export type QuestionOption = { label: string; text: string }
 export type QuestionFigure = { id: string; position: number }
+export type QuestionAnswerFile = { id: string; original_name: string; content_type: string; size: number; position: number; created_at: string }
 
 export type QuestionPart = {
   id: string
@@ -30,6 +31,7 @@ export type MistakeQuestion = {
   error_type: string
   parts: QuestionPart[]
   figures: QuestionFigure[]
+  answer_files: QuestionAnswerFile[]
   status: string
   updated_at: string
 }

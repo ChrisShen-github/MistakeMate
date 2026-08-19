@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { ArrowLeft, CheckCircle2, CircleAlert, FileText, ImagePlus, Layers3, LoaderCircle, Plus, Save, Sparkles, Trash2, WandSparkles } from '@lucide/vue'
+import { ArrowLeft, Camera, CheckCircle2, CircleAlert, FileText, ImagePlus, Layers3, LoaderCircle, Plus, Save, Sparkles, Trash2, WandSparkles } from '@lucide/vue'
 import QuestionPartEditor from './QuestionPartEditor.vue'
 import QuestionText from './QuestionText.vue'
 import type { MistakeQuestion, QuestionPart } from '../types/questions'
@@ -28,6 +28,8 @@ const draft = reactive(cloneQuestion(props.question))
 const isSaving = ref(false)
 const savingAction = ref<'draft' | 'confirmed' | null>(null)
 const isSuggesting = ref(false)
+const isUploadingAnswerPhotos = ref(false)
+const answerPhotoInput = ref<HTMLInputElement | null>(null)
 const feedback = ref('')
 const saveError = ref('')
 const hasParts = computed(() => draft.parts.length > 0)
@@ -37,6 +39,7 @@ const hasUnconfirmedText = computed(() => /[［\[]\s*无法确认\s*[］\]]|【\
 const rootParts = computed(() => draft.parts.filter((part) => !part.parent_id).sort((a, b) => a.position - b.position))
 const answerablePartCount = computed(() => draft.parts.filter((part) => part.part_type !== '题组说明').length)
 const hasSimpleAnswer = computed(() => Boolean(draft.correct_answer.trim() || draft.explanation.trim()))
+const hasAnswerPhotos = computed(() => props.question.answer_files.length > 0)
 const circledLabels = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
 
 watch(() => props.question, (question) => {
@@ -115,6 +118,52 @@ function returnToSimpleMode() {
   draft.parts = []
 }
 
+function answerPhotoUrl(answerFileId: string) {
+  return `/api/mistakes/${props.batchId}/questions/${props.question.id}/answer-files/${answerFileId}`
+}
+
+function chooseAnswerPhotos() {
+  answerPhotoInput.value?.click()
+}
+
+async function uploadAnswerPhotos(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files || [])
+  input.value = ''
+  if (!files.length || isUploadingAnswerPhotos.value) return
+  isUploadingAnswerPhotos.value = true
+  saveError.value = ''
+  feedback.value = ''
+  try {
+    const body = new FormData()
+    files.forEach((file) => body.append('files', file))
+    const response = await fetch(`/api/mistakes/${props.batchId}/questions/${props.question.id}/answer-files`, { method: 'POST', body })
+    const payload = await response.json().catch(() => ({ detail: '答案照片上传失败，请稍后重试。' }))
+    if (!response.ok) throw new Error(payload.detail || '答案照片上传失败，请稍后重试。')
+    emit('saved', payload)
+    feedback.value = `已添加 ${files.length} 张答案照片。`
+  } catch (error) {
+    saveError.value = error instanceof Error ? error.message : '答案照片上传失败，请稍后重试。'
+  } finally {
+    isUploadingAnswerPhotos.value = false
+  }
+}
+
+async function removeAnswerPhoto(answerFileId: string) {
+  if (!window.confirm('确定删除这张答案照片吗？')) return
+  saveError.value = ''
+  feedback.value = ''
+  try {
+    const response = await fetch(`/api/mistakes/${props.batchId}/questions/${props.question.id}/answer-files/${answerFileId}`, { method: 'DELETE' })
+    const payload = await response.json().catch(() => ({ detail: '答案照片删除失败，请稍后重试。' }))
+    if (!response.ok) throw new Error(payload.detail || '答案照片删除失败，请稍后重试。')
+    emit('saved', payload)
+    feedback.value = '已删除答案照片。'
+  } catch (error) {
+    saveError.value = error instanceof Error ? error.message : '答案照片删除失败，请稍后重试。'
+  }
+}
+
 async function save(status: 'draft' | 'confirmed') {
   if (isSaving.value) return
   isSaving.value = true
@@ -187,10 +236,16 @@ async function save(status: 'draft' | 'confirmed') {
       </div>
     </section>
 
-    <details v-if="!hasParts" class="simple-answer-details" :open="hasSimpleAnswer">
-      <summary>答案与解析 <span>可选，不填写也能确认题目</span><small v-if="hasSimpleAnswer">已填写</small></summary>
+    <details v-if="!hasParts" class="simple-answer-details" :open="hasSimpleAnswer || hasAnswerPhotos">
+      <summary>答案与解析 <span>可选，不填写也能确认题目</span><small v-if="hasSimpleAnswer || hasAnswerPhotos">已填写</small></summary>
       <div class="editor-grid answer-grid"><label>正确答案 <span>可选</span><input v-model="draft.correct_answer" maxlength="128" placeholder="有答案时再填写"></label><label class="wide-field">解析 <span>可选</span><textarea v-model="draft.explanation" rows="5" placeholder="有解析时再补充；公式和图形仍建议以原图为准。"></textarea></label></div>
     </details>
+
+    <section class="answer-photo-section" aria-labelledby="answer-photo-heading">
+      <div class="answer-photo-heading"><div><p class="eyebrow">手写答案可选</p><h3 id="answer-photo-heading">答案照片</h3><p>解题过程跨页时可以一次添加多张照片，按上传顺序保存；不影响题目和练习版打印。</p></div><input ref="answerPhotoInput" class="sr-only" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" multiple @change="uploadAnswerPhotos" /><button type="button" :disabled="isUploadingAnswerPhotos" @click="chooseAnswerPhotos"><LoaderCircle v-if="isUploadingAnswerPhotos" class="spin" :size="17" /><Camera v-else :size="17" />{{ isUploadingAnswerPhotos ? '正在上传…' : '拍照或选择照片' }}</button></div>
+      <p v-if="!hasAnswerPhotos" class="answer-photo-empty">暂未添加答案照片。适合保留孩子的手写步骤、演算纸或跨页答案。</p>
+      <div v-else class="answer-photo-list"><figure v-for="answerFile in question.answer_files" :key="answerFile.id"><a :href="answerPhotoUrl(answerFile.id)" target="_blank" rel="noreferrer"><img :src="answerPhotoUrl(answerFile.id)" :alt="`答案照片 ${answerFile.position}：${answerFile.original_name}`" loading="lazy" /><figcaption>第 {{ answerFile.position }} 张 · {{ answerFile.original_name }}</figcaption></a><button type="button" :aria-label="`删除第 ${answerFile.position} 张答案照片`" @click="removeAnswerPhoto(answerFile.id)"><Trash2 :size="16" />删除</button></figure></div>
+    </section>
 
     <div class="editor-grid metadata-grid">
       <label>整题错因<select v-model="draft.error_type"><option value="">暂不填写</option><option>计算错误</option><option>审题不清</option><option>概念不牢</option><option>方法不会</option><option>粗心遗漏</option><option>其他</option></select></label>
@@ -232,10 +287,10 @@ async function save(status: 'draft' | 'confirmed') {
 .text-action,.add-part-button,.add-group-button { color: #285fae; border: 1px solid #b9d1ef; }.suggest-button { color: #fff; border: 1px solid #2563eb; background: #2563eb !important; }.structure-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }.structure-actions button:disabled { cursor: wait; opacity: .65; }
 .option-list,.part-list { display: grid; gap: 11px; margin-top: 15px; }.option-row { display: grid; grid-template-columns: 40px 48px minmax(0,1fr) 44px; gap: 8px; align-items: center; }.option-row > label:first-child { color: #6f8398; font-size: 11px; font-weight: 700; }.option-row input { min-height: 44px; padding: 0 8px; text-align: center; }.option-row textarea { min-height: 44px; padding: 9px; resize: vertical; }.remove-option { display: grid; width: 44px; height: 44px; place-items: center; color: #9f4b40; border: 0; border-radius: 8px; background: #fff3f0; cursor: pointer; }.empty-options { margin: 13px 0 0; color: #71859a; font-size: 13px; }
 .simple-mode-button { justify-self: start; min-height: 44px; padding: 8px 12px; color: #8b534b; border: 1px solid #e5c2bc; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
-.simple-answer-details { margin-top: 23px; overflow: hidden; border: 1px solid #d8e5f2; border-radius: 10px; background: #f8fbff; }.simple-answer-details summary { display: flex; min-height: 46px; box-sizing: border-box; align-items: center; gap: 7px; padding: 12px 16px; color: #355875; font-size: 13px; font-weight: 700; cursor: pointer; }.simple-answer-details summary span { color: #71879c; font-size: 11px; font-weight: 500; }.simple-answer-details summary small { margin-left: auto; padding: 3px 6px; color: #247358; border-radius: 5px; background: #e8f7f0; }.simple-answer-details .answer-grid { margin: 0; padding: 2px 16px 16px; }.metadata-grid { margin-top: 23px; }.editor-actions { align-items: center; margin-top: 24px; padding-top: 17px; border-top: 1px solid #e0e7ee; }.editor-actions p { display: flex; align-items: flex-start; gap: 7px; margin: 0; color: #657b92; font-size: 12px; line-height: 1.5; }.editor-actions p span { color: #2f9a75; font-size: 14px; }.editor-actions p.action-message { max-width: 560px; padding: 9px 11px; border-radius: 8px; font-weight: 700; }.editor-actions p.action-message svg { flex: 0 0 auto; }.editor-actions p.action-message.success { color: #247358; background: #e8f7f0; }.editor-actions p.action-message.error { color: #a7483b; background: #fff0ed; }.editor-actions > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }.editor-actions button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 6px; padding: 9px 13px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }.back-library-button,.draft-button { color: #315f9b; border: 1px solid #b9cee5; background: #fff; }.confirm-button { min-width: 122px; color: #fff; border: 1px solid #f97316; background: #f97316; }.editor-actions button:disabled { cursor: wait; opacity: .6; }
+.simple-answer-details { margin-top: 23px; overflow: hidden; border: 1px solid #d8e5f2; border-radius: 10px; background: #f8fbff; }.simple-answer-details summary { display: flex; min-height: 46px; box-sizing: border-box; align-items: center; gap: 7px; padding: 12px 16px; color: #355875; font-size: 13px; font-weight: 700; cursor: pointer; }.simple-answer-details summary span { color: #71879c; font-size: 11px; font-weight: 500; }.simple-answer-details summary small { margin-left: auto; padding: 3px 6px; color: #247358; border-radius: 5px; background: #e8f7f0; }.simple-answer-details .answer-grid { margin: 0; padding: 2px 16px 16px; }.answer-photo-section { margin-top: 23px; padding: 17px; border: 1px solid #d8e5f2; border-radius: 10px; background: #fbfdff; }.answer-photo-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }.answer-photo-heading h3 { margin: 0; color: #29435f; font-size: 16px; }.answer-photo-heading p:last-child { max-width: 640px; margin: 6px 0 0; color: #667f98; font-size: 12px; line-height: 1.55; }.answer-photo-heading > button { display: inline-flex; min-height: 44px; flex: 0 0 auto; align-items: center; justify-content: center; gap: 6px; padding: 9px 12px; color: #285fae; border: 1px solid #b9d1ef; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }.answer-photo-heading > button:disabled { cursor: wait; opacity: .6; }.answer-photo-empty { margin: 14px 0 0; padding: 10px 11px; color: #71869a; border-radius: 8px; background: #f4f8fc; font-size: 12px; line-height: 1.55; }.answer-photo-list { display: grid; grid-template-columns: repeat(auto-fill,minmax(170px,1fr)); gap: 11px; margin-top: 14px; }.answer-photo-list figure { margin: 0; overflow: hidden; border: 1px solid #d9e4ef; border-radius: 8px; background: #fff; }.answer-photo-list a { display: block; color: inherit; text-decoration: none; }.answer-photo-list img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #f2f5f8; }.answer-photo-list figcaption { overflow: hidden; padding: 8px 9px; color: #5f7690; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }.answer-photo-list button { display: inline-flex; width: calc(100% - 16px); min-height: 44px; align-items: center; justify-content: center; gap: 5px; margin: 0 8px 8px; color: #a84b3d; border: 1px solid #e5bbb4; border-radius: 7px; background: #fff; font-size: 11px; font-weight: 700; cursor: pointer; }.metadata-grid { margin-top: 23px; }.editor-actions { align-items: center; margin-top: 24px; padding-top: 17px; border-top: 1px solid #e0e7ee; }.editor-actions p { display: flex; align-items: flex-start; gap: 7px; margin: 0; color: #657b92; font-size: 12px; line-height: 1.5; }.editor-actions p span { color: #2f9a75; font-size: 14px; }.editor-actions p.action-message { max-width: 560px; padding: 9px 11px; border-radius: 8px; font-weight: 700; }.editor-actions p.action-message svg { flex: 0 0 auto; }.editor-actions p.action-message.success { color: #247358; background: #e8f7f0; }.editor-actions p.action-message.error { color: #a7483b; background: #fff0ed; }.editor-actions > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }.editor-actions button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 6px; padding: 9px 13px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }.back-library-button,.draft-button { color: #315f9b; border: 1px solid #b9cee5; background: #fff; }.confirm-button { min-width: 122px; color: #fff; border: 1px solid #f97316; background: #f97316; }.editor-actions button:disabled { cursor: wait; opacity: .6; }
 .spin { animation: rotate .8s linear infinite; }@keyframes rotate { to { transform: rotate(360deg); } }.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 @media (max-width: 760px) {
-  .question-editor { margin-top: 18px; padding: 17px; }.editor-heading,.structure-heading,.editor-actions { align-items: stretch; flex-direction: column; }.draft-chip { align-self: flex-start; }.editor-grid { grid-template-columns: 1fr; gap: 14px; }.wide-field { grid-column: auto; }.figure-section { grid-template-columns: 1fr; }.figure-actions { display: grid; grid-template-columns: 1fr; }.figure-actions button { width: 100%; }.options-section,.structure-section { padding: 15px; }.structure-actions { display: grid; grid-template-columns: 1fr 1fr; }.suggest-button { grid-column: 1 / -1; }.option-row { grid-template-columns: 43px minmax(0,1fr) 44px; }.option-row > label:first-child { display: none; }.option-row textarea { grid-column: 1 / -1; grid-row: 2; }.option-row input { grid-column: 1; grid-row: 1; }.remove-option { grid-column: 3; grid-row: 1; }.editor-actions > div { display: grid; grid-template-columns: 1fr 1fr; }.back-library-button { grid-column: 1 / -1; }.editor-actions button { width: 100%; }
+  .question-editor { margin-top: 18px; padding: 17px; }.editor-heading,.structure-heading,.editor-actions,.answer-photo-heading { align-items: stretch; flex-direction: column; }.draft-chip { align-self: flex-start; }.editor-grid { grid-template-columns: 1fr; gap: 14px; }.wide-field { grid-column: auto; }.figure-section { grid-template-columns: 1fr; }.figure-actions { display: grid; grid-template-columns: 1fr; }.figure-actions button,.answer-photo-heading > button { width: 100%; }.options-section,.structure-section,.answer-photo-section { padding: 15px; }.structure-actions { display: grid; grid-template-columns: 1fr 1fr; }.suggest-button { grid-column: 1 / -1; }.option-row { grid-template-columns: 43px minmax(0,1fr) 44px; }.option-row > label:first-child { display: none; }.option-row textarea { grid-column: 1 / -1; grid-row: 2; }.option-row input { grid-column: 1; grid-row: 1; }.remove-option { grid-column: 3; grid-row: 1; }.answer-photo-list { grid-template-columns: repeat(2,minmax(0,1fr)); }.editor-actions > div { display: grid; grid-template-columns: 1fr 1fr; }.back-library-button { grid-column: 1 / -1; }.editor-actions button { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) { .stars button { transition: none; }.spin { animation: none; } }
 </style>

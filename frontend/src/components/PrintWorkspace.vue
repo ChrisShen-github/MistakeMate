@@ -21,6 +21,9 @@ type PrintableQuestion = MistakeQuestion & {
   subject: string
   source: string
   batch_created_at: string
+  print_kind?: 'text' | 'clean_image'
+  clean_image_file_id?: string | null
+  clean_image_name?: string
 }
 
 type Orientation = 'portrait' | 'landscape'
@@ -177,6 +180,14 @@ function figureUrl(question: PrintableQuestion, figureId: string) {
   return `/api/mistakes/${question.batch_id}/questions/${question.id}/figures/${figureId}`
 }
 
+function isCleanOriginal(question: PrintableQuestion) {
+  return question.print_kind === 'clean_image' && Boolean(question.clean_image_file_id)
+}
+
+function cleanImageUrl(question: PrintableQuestion) {
+  return `/api/mistakes/${question.batch_id}/files/${question.clean_image_file_id}/clean-image`
+}
+
 function rootParts(question: PrintableQuestion) {
   return question.parts.filter((part) => !part.parent_id).sort((a, b) => a.position - b.position)
 }
@@ -211,6 +222,7 @@ function hasPartAnswer(part: QuestionPart) {
 }
 
 function hasAnswer(question: PrintableQuestion) {
+  if (isCleanOriginal(question)) return false
   return Boolean(question.correct_answer.trim() || question.explanation.trim() || question.parts.some(hasPartAnswer))
 }
 
@@ -250,6 +262,7 @@ function estimatedTextHeight(text: string, charactersPerLine: number) {
 }
 
 function estimateQuestionHeight(question: PrintableQuestion) {
+  if (isCleanOriginal(question)) return Math.max(80, trimSize.value.height - settings.value.margins.top - settings.value.margins.bottom - 28)
   const contentWidth = Math.max(35, (trimSize.value.width - settings.value.margins.left - extraBindingMargin.value - settings.value.margins.right - (settings.value.columns - 1) * 7) / settings.value.columns)
   const charactersPerLine = Math.max(8, Math.floor(contentWidth / (settings.value.fontSize * 0.37)))
   let height = 9 + estimatedTextHeight(question.stem, charactersPerLine)
@@ -294,12 +307,17 @@ const pages = computed<PrintPage[]>(() => {
 
   selectedQuestions.value.forEach((question, index) => {
     const adjustment = adjustmentFor(question)
-    const currentPageHasContent = pageList[pageIndex].columns.some((column) => column.length)
+    let currentPageHasContent = pageList[pageIndex].columns.some((column) => column.length)
+    if (isCleanOriginal(question) && currentPageHasContent) {
+      createPage()
+      currentPageHasContent = false
+    }
     if (adjustment.pageBreakBefore && currentPageHasContent) createPage()
     const estimatedHeight = estimateQuestionHeight(question)
     if (usedHeight > 0 && usedHeight + estimatedHeight > availableHeight) advanceColumn()
     pageList[pageIndex].columns[columnIndex].push({ question, number: index + 1, oversized: estimatedHeight > availableHeight })
     usedHeight += estimatedHeight
+    if (isCleanOriginal(question) && index < selectedQuestions.value.length - 1) createPage()
   })
   return pageList.filter((page) => page.columns.some((column) => column.length))
 })
@@ -429,7 +447,7 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
 
     <div v-if="isLoading" class="state-card screen-only" aria-live="polite"><LoaderCircle class="spin" :size="22" />正在准备打印模板…</div>
     <div v-else-if="errorMessage && !questions.length" class="state-card error screen-only" role="alert"><RefreshCw :size="21" /><div><strong>读取失败</strong><p>{{ errorMessage }}</p></div><button type="button" @click="loadData">重试</button></div>
-    <div v-else-if="!questions.length" class="state-card empty screen-only"><FileText :size="28" /><strong>还没有可打印的题目</strong><p>先在“我的错题”中完成 OCR 核对并确认题目。</p><button type="button" @click="emit('back')">返回我的错题</button></div>
+    <div v-else-if="!questions.length" class="state-card empty screen-only"><FileText :size="28" /><strong>还没有可打印的内容</strong><p>先确认 OCR 题目，或在清洁原图核对后点击“确认此清洁图可用”。</p><button type="button" @click="emit('back')">返回我的错题</button></div>
 
     <div v-else class="studio-grid">
       <aside class="studio-panel questions-panel screen-only" :class="{ 'mobile-visible': mobileStep === 'questions' }" aria-label="选择题目">
@@ -443,7 +461,7 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
           <article v-for="question in visibleQuestions" :key="question.id" class="question-editor" :class="{ selected: selectedIds.includes(question.id) }">
             <label class="question-check">
               <input type="checkbox" :checked="selectedIds.includes(question.id)" @change="toggleQuestion(question)" />
-              <span><strong>{{ question.subject }} · {{ question.source }}</strong><small>{{ question.stem }}</small></span>
+              <span><strong>{{ question.subject }} · {{ isCleanOriginal(question) ? '清洁原图' : question.source }}</strong><small>{{ isCleanOriginal(question) ? question.clean_image_name : question.stem }}</small></span>
             </label>
             <div v-if="selectedIds.includes(question.id)" class="question-tools">
               <div class="tool-row">
@@ -475,14 +493,16 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
 
                 <div class="paper-body">
                   <div v-for="(column, columnIndex) in page.columns" :key="columnIndex" class="paper-column">
-                    <section v-for="item in column" :key="item.question.id" class="print-question" :class="{ oversized: item.oversized, 'without-divider': !settings.showQuestionDivider, 'without-number': !settings.showQuestionNumbers }">
+                    <section v-for="item in column" :key="item.question.id" class="print-question" :class="{ oversized: item.oversized, 'clean-original': isCleanOriginal(item.question), 'without-divider': !settings.showQuestionDivider, 'without-number': !settings.showQuestionNumbers }">
                     <div v-if="settings.showQuestionNumbers" class="question-number">{{ item.number }}</div>
                     <div class="question-content">
                       <div v-if="settings.showMeta" class="question-meta">
                         <span>{{ item.question.subject }}</span><span>{{ item.question.question_type }}</span>
-                        <span v-if="settings.showDifficulty">难度 {{ '★'.repeat(item.question.difficulty) }}</span>
+                        <span v-if="settings.showDifficulty && !isCleanOriginal(item.question)">难度 {{ '★'.repeat(item.question.difficulty) }}</span>
                         <span v-if="settings.showDate">{{ formatDate(item.question.batch_created_at) }}</span>
                       </div>
+                      <img v-if="isCleanOriginal(item.question)" class="print-clean-image" :src="cleanImageUrl(item.question)" :alt="`清洁原图：${item.question.clean_image_name}`" />
+                      <template v-else>
                       <QuestionText class="question-stem" :text="item.question.stem" />
                       <div v-if="item.question.figures.length" class="question-figures"><img v-for="figure in item.question.figures" :key="figure.id" :src="figureUrl(item.question, figure.id)" alt="题目图形" /></div>
                       <ol v-if="item.question.options.length" class="option-list">
@@ -505,7 +525,8 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
                       </div>
                       <div v-else-if="settings.showAnswers" class="printed-answer"><strong>答案</strong><span>{{ item.question.correct_answer || '暂未录入' }}</span><p v-if="item.question.explanation">{{ item.question.explanation }}</p></div>
                       <div v-else-if="settings.showAnswerLines" class="answer-lines"><span v-for="line in questionAnswerLines(item.question)" :key="line"></span></div>
-                      <p v-if="item.oversized" class="overflow-warning screen-only">本题超过单页高度，请减少字号、题间距或页边距。</p>
+                      </template>
+                      <p v-if="item.oversized && !isCleanOriginal(item.question)" class="overflow-warning screen-only">本题超过单页高度，请减少字号、题间距或页边距。</p>
                     </div>
                     </section>
                   </div>
@@ -611,5 +632,5 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
 @media(max-width:900px){.print-workspace{padding:18px 14px 88px}.studio-heading{align-items:stretch;flex-direction:column}.studio-heading h1{font-size:26px}.heading-actions{display:none}.mobile-steps{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:16px;padding:4px;border-radius:10px;background:#e9eff6}.mobile-steps button{min-height:42px;color:#627990;border:0;border-radius:7px;background:transparent;font-size:12px;font-weight:700}.mobile-steps button.active{color:#285faa;background:#fff;box-shadow:0 1px 4px rgba(46,72,101,.13)}.studio-grid{display:block;margin-top:12px}.studio-panel,.preview-panel{display:none}.studio-panel.mobile-visible,.preview-panel.mobile-visible{display:block}.questions-panel,.settings-panel{position:static;max-height:none}.question-editor-list{max-height:none}.settings-panel.mobile-visible{display:block}.preview-panel{margin-inline:-14px;border-right:0;border-left:0;border-radius:0}.preview-toolbar{border-radius:0}.page-stage{padding:12px 8px}.page-stack{zoom:.48}.zoom-note{display:none}.mobile-bottom-bar{position:fixed;z-index:30;right:0;bottom:0;left:0;display:flex;min-height:68px;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));color:#516a82;border-top:1px solid #d6e0ea;background:rgba(255,255,255,.96);box-shadow:0 -4px 18px rgba(34,58,83,.1);font-size:12px;font-weight:700}.mobile-bottom-bar button{min-width:116px}.template-grid{grid-template-columns:1fr 1fr}}
 @media print{:global(.sidebar),:global(.topbar),:global(.toast),.screen-only{display:none!important}:global(html),:global(body),:global(.app-shell),:global(.main-content){min-height:0!important;margin:0!important;background:#fff!important}.print-workspace,.studio-grid,.preview-panel,.page-stage,.page-stack{display:block!important;width:auto!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;overflow:visible!important;border:0!important;background:#fff!important;zoom:1!important}.paper-sheet,.paper-sheet.imposed{width:var(--paper-width);height:var(--paper-height);margin:0;background:#fff;box-shadow:none;break-after:page;page-break-after:always}.paper-sheet.imposed .trim-area{box-shadow:none}.paper-sheet:last-child{break-after:auto;page-break-after:auto}}
 .question-stem :deep(.table-scroll){margin:1.6mm 0;overflow:visible;border-color:#96a5b3;border-radius:0}.question-stem :deep(table){min-width:0;table-layout:fixed;font-size:calc(var(--paper-font-size) - .35pt)}.question-stem :deep(th),.question-stem :deep(td){padding:1.25mm 1.6mm;border-color:#aebac5;overflow-wrap:anywhere}.question-stem :deep(th){color:#1f2937;background:#edf1f4}
-.question-figures{display:grid;gap:2.5mm;margin-top:2.5mm}.question-figures img{display:block;max-width:100%;max-height:78mm;object-fit:contain;object-position:left top;border:.25mm solid #b9c1c9;break-inside:avoid}
+.question-figures{display:grid;gap:2.5mm;margin-top:2.5mm}.question-figures img{display:block;max-width:100%;max-height:78mm;object-fit:contain;object-position:left top;border:.25mm solid #b9c1c9;break-inside:avoid}.print-question.clean-original{display:block;padding-top:var(--question-gap)}.print-clean-image{display:block;width:100%;max-height:190mm;object-fit:contain;object-position:left top;break-inside:avoid}
 </style>

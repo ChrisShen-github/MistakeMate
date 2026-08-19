@@ -33,9 +33,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FILES_PER_BATCH = 12
+MAX_ANSWER_FILES_PER_QUESTION = 8
 CHUNK_SIZE = 1024 * 1024
 ALLOWED_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/heic", "image/heif", "image/webp"}
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".pdf"}
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp"}
 SESSION_COOKIE = "mistakemate_session"
 SESSION_DAYS = 30
 OCR_MODEL_BASE_URL = "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0"
@@ -178,6 +180,7 @@ class MistakeQuestion(Base):
     batch: Mapped[UploadBatch] = relationship(back_populates="questions")
     parts: Mapped[list["QuestionPart"]] = relationship(back_populates="question", cascade="all, delete-orphan")
     figures: Mapped[list["QuestionFigure"]] = relationship(back_populates="question", cascade="all, delete-orphan")
+    answer_files: Mapped[list["QuestionAnswerFile"]] = relationship(back_populates="question", cascade="all, delete-orphan")
 
 
 class QuestionPart(Base):
@@ -210,6 +213,22 @@ class QuestionFigure(Base):
     position: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     question: Mapped[MistakeQuestion] = relationship(back_populates="figures")
+
+
+class QuestionAnswerFile(Base):
+    """Optional photographed answer pages belonging to one question."""
+
+    __tablename__ = "question_answer_files"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    question_id: Mapped[str] = mapped_column(ForeignKey("mistake_questions.id"), index=True)
+    original_name: Mapped[str] = mapped_column(String(255))
+    stored_name: Mapped[str] = mapped_column(String(255), unique=True)
+    content_type: Mapped[str] = mapped_column(String(128))
+    size: Mapped[int] = mapped_column(Integer)
+    position: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    question: Mapped[MistakeQuestion] = relationship(back_populates="answer_files")
 
 
 class PrintTemplate(Base):
@@ -393,6 +412,15 @@ class QuestionFigureResponse(BaseModel):
     position: int
 
 
+class QuestionAnswerFileResponse(BaseModel):
+    id: str
+    original_name: str
+    content_type: str
+    size: int
+    position: int
+    created_at: datetime
+
+
 class QuestionFigureCreateRequest(BaseModel):
     file_id: str
     x: float = 0
@@ -434,6 +462,7 @@ class MistakeQuestionResponse(BaseModel):
     error_type: str
     parts: list[QuestionPartPayload]
     figures: list[QuestionFigureResponse]
+    answer_files: list[QuestionAnswerFileResponse]
     status: str
     updated_at: datetime
 
@@ -471,6 +500,9 @@ class PrintableQuestionResponse(MistakeQuestionResponse):
     subject: str
     source: str
     batch_created_at: datetime
+    print_kind: str = "text"
+    clean_image_file_id: str | None = None
+    clean_image_name: str = ""
 
 
 class PrintTemplatePayload(BaseModel):
@@ -738,6 +770,17 @@ def to_question_response(question: MistakeQuestion) -> MistakeQuestionResponse:
         error_type=question.error_type,
         parts=[to_question_part_payload(part) for part in sorted(question.parts, key=lambda item: item.position)],
         figures=[QuestionFigureResponse(id=figure.id, position=figure.position) for figure in sorted(question.figures, key=lambda item: item.position)],
+        answer_files=[
+            QuestionAnswerFileResponse(
+                id=answer_file.id,
+                original_name=answer_file.original_name,
+                content_type=answer_file.content_type,
+                size=answer_file.size,
+                position=answer_file.position,
+                created_at=answer_file.created_at,
+            )
+            for answer_file in sorted(question.answer_files, key=lambda item: item.position)
+        ],
         status=question.status,
         updated_at=question.updated_at,
     )
@@ -2124,7 +2167,7 @@ def list_printable_questions(subject: str | None = None, user: AppUser = Depends
 
     with SessionLocal() as session:
         rows = session.execute(statement).all()
-        return [
+        text_questions = [
             PrintableQuestionResponse(
                 **to_question_response(question).model_dump(),
                 batch_id=batch.id,
@@ -2134,6 +2177,44 @@ def list_printable_questions(subject: str | None = None, user: AppUser = Depends
             )
             for question, batch in rows
         ]
+        clean_statement = (
+            select(UploadBatch, UploadedFile, CleanImage)
+            .join(UploadedFile, UploadedFile.batch_id == UploadBatch.id)
+            .join(CleanImage, CleanImage.source_file_id == UploadedFile.id)
+            .where(UploadBatch.owner_id == user.id, CleanImage.approved_at.is_not(None))
+            .order_by(UploadBatch.created_at.desc(), UploadedFile.original_name.asc())
+        )
+        if subject:
+            clean_statement = clean_statement.where(UploadBatch.subject == subject)
+        clean_rows = session.execute(clean_statement).all()
+        clean_questions = [
+            PrintableQuestionResponse(
+                id=f"clean-{file.id}",
+                position=index + 1,
+                question_type="清洁原图",
+                stem="",
+                options=[],
+                correct_answer="",
+                explanation="",
+                knowledge_points="",
+                difficulty=0,
+                error_type="",
+                parts=[],
+                figures=[],
+                answer_files=[],
+                status="confirmed",
+                updated_at=clean_image.approved_at or clean_image.created_at,
+                batch_id=batch.id,
+                subject=batch.subject,
+                source=batch.source,
+                batch_created_at=batch.created_at,
+                print_kind="clean_image",
+                clean_image_file_id=file.id,
+                clean_image_name=file.original_name,
+            )
+            for index, (batch, file, clean_image) in enumerate(clean_rows)
+        ]
+        return [*text_questions, *clean_questions]
 
 
 def to_print_template_response(template: PrintTemplate) -> PrintTemplateResponse:
@@ -2502,6 +2583,109 @@ def delete_question_figure(batch_id: str, question_id: str, figure_id: str, user
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到题图。")
         path = storage_root / "uploads" / batch.id / "figures" / figure.stored_name
         session.delete(figure)
+    path.unlink(missing_ok=True)
+    with SessionLocal() as session:
+        question = session.get(MistakeQuestion, question_id)
+        if question is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+        return to_question_response(question)
+
+
+@app.post("/api/mistakes/{batch_id}/questions/{question_id}/answer-files", response_model=MistakeQuestionResponse, status_code=status.HTTP_201_CREATED)
+async def upload_question_answer_files(
+    batch_id: str,
+    question_id: str,
+    files: list[UploadFile] = File(...),
+    user: AppUser = Depends(require_user),
+) -> MistakeQuestionResponse:
+    if not files:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请至少选择一张答案照片。")
+    if len(files) > MAX_ANSWER_FILES_PER_QUESTION:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"一次最多添加 {MAX_ANSWER_FILES_PER_QUESTION} 张答案照片。")
+
+    with SessionLocal() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        question = session.get(MistakeQuestion, question_id)
+        if question is None or question.batch_id != batch.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+        existing_count = session.scalar(select(func.count(QuestionAnswerFile.id)).where(QuestionAnswerFile.question_id == question.id)) or 0
+        if existing_count + len(files) > MAX_ANSWER_FILES_PER_QUESTION:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"每道题最多保存 {MAX_ANSWER_FILES_PER_QUESTION} 张答案照片。")
+
+    answer_directory = storage_root / "uploads" / batch_id / "answers" / question_id
+    answer_directory.mkdir(parents=True, exist_ok=True)
+    saved_files: list[tuple[QuestionAnswerFile, Path]] = []
+    written_paths: list[Path] = []
+    try:
+        for offset, uploaded in enumerate(files):
+            original_name = uploaded.filename or "answer-photo"
+            extension = Path(original_name).suffix.lower()
+            content_type = uploaded.content_type or "application/octet-stream"
+            if extension not in ALLOWED_IMAGE_EXTENSIONS or (not content_type.startswith("image/") and content_type != "application/octet-stream"):
+                raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=f"答案照片只支持 JPG、PNG、WebP、HEIC：{original_name}")
+            stored_name = f"{uuid4()}{extension}"
+            destination = answer_directory / stored_name
+            written_paths.append(destination)
+            size = 0
+            with destination.open("wb") as target:
+                while chunk := await uploaded.read(CHUNK_SIZE):
+                    size += len(chunk)
+                    if size > MAX_FILE_SIZE:
+                        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"答案照片超过 20 MB：{original_name}")
+                    target.write(chunk)
+            await uploaded.close()
+            saved_files.append((
+                QuestionAnswerFile(
+                    id=str(uuid4()), question_id=question_id, original_name=original_name[:255], stored_name=stored_name,
+                    content_type=content_type if content_type.startswith("image/") else "image/jpeg", size=size, position=existing_count + offset + 1,
+                ),
+                destination,
+            ))
+        with SessionLocal.begin() as session:
+            batch = get_owned_batch(session, batch_id, user.id)
+            question = session.get(MistakeQuestion, question_id)
+            if question is None or question.batch_id != batch.id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+            session.add_all(record for record, _ in saved_files)
+    except Exception:
+        for path in written_paths:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        for uploaded in files:
+            await uploaded.close()
+
+    with SessionLocal() as session:
+        question = session.get(MistakeQuestion, question_id)
+        if question is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+        return to_question_response(question)
+
+
+@app.get("/api/mistakes/{batch_id}/questions/{question_id}/answer-files/{answer_file_id}")
+def get_question_answer_file(batch_id: str, question_id: str, answer_file_id: str, user: AppUser = Depends(require_user)) -> FileResponse:
+    with SessionLocal() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        question = session.get(MistakeQuestion, question_id)
+        answer_file = session.get(QuestionAnswerFile, answer_file_id)
+        if question is None or question.batch_id != batch.id or answer_file is None or answer_file.question_id != question.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到答案照片。")
+        path = storage_root / "uploads" / batch_id / "answers" / question_id / answer_file.stored_name
+    if not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="答案照片已不存在。")
+    return FileResponse(path, media_type=answer_file.content_type)
+
+
+@app.delete("/api/mistakes/{batch_id}/questions/{question_id}/answer-files/{answer_file_id}", response_model=MistakeQuestionResponse)
+def delete_question_answer_file(batch_id: str, question_id: str, answer_file_id: str, user: AppUser = Depends(require_user)) -> MistakeQuestionResponse:
+    with SessionLocal.begin() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        question = session.get(MistakeQuestion, question_id)
+        answer_file = session.get(QuestionAnswerFile, answer_file_id)
+        if question is None or question.batch_id != batch.id or answer_file is None or answer_file.question_id != question.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到答案照片。")
+        path = storage_root / "uploads" / batch_id / "answers" / question_id / answer_file.stored_name
+        session.delete(answer_file)
     path.unlink(missing_ok=True)
     with SessionLocal() as session:
         question = session.get(MistakeQuestion, question_id)

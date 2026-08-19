@@ -21,6 +21,10 @@ Use this skill for a user's own MistakeMate account when they ask to review a wr
 - Only proceed from a prepared link to an actual browser print action after the user explicitly confirms the selected question, copies, paper size, and template.
 - Never use this integration to delete questions, edit account data, or access another user's records.
 
+## First-time setup
+
+If the MCP tools are unavailable, ask the user for permission to install the MistakeMate integration. Ask for the MistakeMate address and a newly created Hermes token, then run the repository's `integrations/hermes-mcp/install.py` with `--url` and `--token`. Do not paste the token into chat logs or source files. If an existing `mistakemate` MCP entry is found, explain that replacing it requires explicit user approval and the `--replace` option.
+
 ## Common workflows
 
 ### Today's review

@@ -23,7 +23,15 @@ Compose 会直接拉取 `akwangdao/mistakemate:latest`，不需要本机构建�
 
 “账户设置”底部的 **Hermes 控制** 可以创建独立访问令牌。令牌仅显示一次，可随时撤销；它只能读取今日任务和已确认题目、记录“做对/做错”，以及准备指定题目的打印工作台链接，不能删除错题或修改账户。
 
-将仓库中的 `integrations/hermes-mcp/server.py` 放在运行 Hermes 的机器上，并在 Hermes 的 `config.yaml` 添加一个受限 MCP 服务：
+最省事的方式是让 Hermes 自己安装：先在网页创建令牌，然后对 Hermes 说“安装 MistakeMate 控制，先向我索要地址和令牌，安装后测试连接”。Hermes 在得到明确许可后，可下载本仓库并运行：
+
+```powershell
+python integrations/hermes-mcp/install.py --url "http://你的-MistakeMate-地址:8080" --token "mmh_…"
+```
+
+安装器会复制 skill 与 MCP 脚本，再调用 `hermes mcp add` 和 `hermes mcp test`。如果电脑已有同名配置，它会停止而非覆盖；确认更新时再加 `--replace`。
+
+也可以手动将仓库中的 `integrations/hermes-mcp/server.py` 放在运行 Hermes 的机器上，并在 Hermes 的 `config.yaml` 添加一个受限 MCP 服务：
 
 ```yaml
 mcp_servers:

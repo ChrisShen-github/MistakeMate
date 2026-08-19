@@ -1,4 +1,5 @@
 export type QuestionOption = { label: string; text: string }
+export type QuestionFigure = { id: string; position: number }
 
 export type QuestionPart = {
   id: string
@@ -28,6 +29,7 @@ export type MistakeQuestion = {
   difficulty: number
   error_type: string
   parts: QuestionPart[]
+  figures: QuestionFigure[]
   status: string
   updated_at: string
 }

@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ArrowLeft, CheckCircle2, CircleAlert, FileImage, FileText, ImageOff, Info, LoaderCircle, RefreshCw, ScanText, Sparkles, WandSparkles } from '@lucide/vue'
 import QuestionEditor from './QuestionEditor.vue'
+import ImageCropper, { type CropRegion } from './ImageCropper.vue'
 import type { MistakeQuestion } from '../types/questions'
 
 type UploadedFile = { id: string; original_name: string; content_type: string; size: number }
@@ -15,6 +16,10 @@ const isLoading = ref(true)
 const isRequestingOcr = ref(false)
 const isRequestingAi = ref(false)
 const errorMessage = ref('')
+const figureTargetQuestionId = ref('')
+const figureSource = ref<UploadedFile | null>(null)
+const figureCropFile = ref<File | null>(null)
+const isSavingFigure = ref(false)
 let refreshTimer: number | undefined
 
 const imageFiles = computed(() => batch.value?.files.filter((file) => file.content_type.startsWith('image/') && !['image/heic', 'image/heif'].includes(file.content_type)) ?? [])
@@ -108,6 +113,68 @@ function updateQuestion(question: MistakeQuestion) {
   batch.value.status = question.status === 'confirmed' ? 'confirmed' : 'review_ready'
 }
 
+function startFigureCapture(questionId: string) {
+  if (!imageFiles.value.length) return
+  figureTargetQuestionId.value = questionId
+  figureSource.value = null
+  figureCropFile.value = null
+  errorMessage.value = ''
+}
+
+function clearFigureCapture() {
+  figureTargetQuestionId.value = ''
+  figureSource.value = null
+  figureCropFile.value = null
+  isSavingFigure.value = false
+}
+
+async function chooseFigureSource(file: UploadedFile) {
+  errorMessage.value = ''
+  try {
+    const response = await fetch(fileUrl(file))
+    if (!response.ok) throw new Error('无法读取原图，请稍后重试。')
+    const blob = await response.blob()
+    figureSource.value = file
+    figureCropFile.value = new File([blob], file.original_name, { type: blob.type || file.content_type })
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '无法读取原图，请稍后重试。'
+  }
+}
+
+async function saveFigure(region: CropRegion | null) {
+  if (!figureTargetQuestionId.value || !figureSource.value || isSavingFigure.value) return
+  isSavingFigure.value = true
+  errorMessage.value = ''
+  const box = region ?? { x: 0, y: 0, width: 1, height: 1 }
+  try {
+    const response = await fetch(`/api/mistakes/${props.batchId}/questions/${figureTargetQuestionId.value}/figures`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file_id: figureSource.value.id, ...box }),
+    })
+    const payload = await response.json().catch(() => ({ detail: '题图保存失败，请稍后重试。' }))
+    if (!response.ok) throw new Error(payload.detail)
+    updateQuestion(payload)
+    clearFigureCapture()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '题图保存失败，请稍后重试。'
+    figureCropFile.value = null
+  } finally {
+    isSavingFigure.value = false
+  }
+}
+
+async function removeFigure(questionId: string, figureId: string) {
+  if (!window.confirm('删除这张题图吗？删除后不会出现在打印页。')) return
+  errorMessage.value = ''
+  try {
+    const response = await fetch(`/api/mistakes/${props.batchId}/questions/${questionId}/figures/${figureId}`, { method: 'DELETE' })
+    const payload = await response.json().catch(() => ({ detail: '无法删除题图。' }))
+    if (!response.ok) throw new Error(payload.detail)
+    updateQuestion(payload)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '无法删除题图。'
+  }
+}
+
 watch(() => props.batchId, () => { clearRefreshTimer(); loadBatch() })
 onMounted(loadBatch)
 onBeforeUnmount(clearRefreshTimer)
@@ -129,6 +196,8 @@ onBeforeUnmount(clearRefreshTimer)
 
       <section class="review-tip" :class="{ confirmed: batch.status === 'confirmed' }"><CheckCircle2 v-if="batch.status === 'confirmed'" :size="19" /><Info v-else :size="19" /><div><strong>{{ batch.status === 'confirmed' ? '题目已确认，已进入错题库' : batch.ocr?.status === 'completed' ? `${recognitionName(batch.ocr)}已完成，请核对文字` : `原图已保存，等待${recognitionName(batch.ocr)}` }}</strong><p>{{ batch.status === 'confirmed' ? '可以继续修改并重新确认；如果识别内容不完整，也可以重新识别原图。' : batch.ocr?.status === 'completed' ? '识别结果仅作初稿，尤其是手写字符、公式和步骤，请在后续题目确认页核对。' : isAiRecognition(batch.ocr) ? '题图将发送到你配置的 AI 服务，直接由视觉模型识别。' : '使用开源 PaddleOCR 在本机处理，不会把题图上传到第三方服务。首次识别会下载模型，时间会更长。' }}</p></div><button v-if="!batch.ocr || batch.ocr.status === 'failed'" class="ocr-button" type="button" :disabled="isRequestingOcr" @click="startOcr(false)"><ScanText :size="17" />{{ isRequestingOcr ? '正在启动…' : `开始${recognitionName(batch.ocr)}` }}</button><button v-else-if="batch.ocr.status === 'completed'" class="reocr-button" type="button" :disabled="isRequestingOcr" @click="startOcr(true)"><LoaderCircle v-if="isRequestingOcr" class="spin" :size="17" /><RefreshCw v-else :size="17" />{{ isRequestingOcr ? '正在启动…' : `重新${recognitionName(batch.ocr)}` }}</button><span v-else-if="['queued', 'running'].includes(batch.ocr.status)" class="ocr-progress"><LoaderCircle class="spin" :size="17" />{{ ocrLabel(batch.ocr.status, batch.ocr) }}</span></section>
 
+      <section v-if="figureTargetQuestionId && !figureCropFile" class="figure-source-picker" aria-label="选择题图来源"><div><p class="eyebrow">添加题图</p><h2>选择包含图形的原图</h2><p>选择后可框选坐标轴、几何图或统计图；文字题干仍保留为可编辑文本。</p></div><button type="button" @click="clearFigureCapture">取消</button><div class="figure-source-list"><button v-for="file in imageFiles" :key="file.id" type="button" @click="chooseFigureSource(file)"><img :src="fileUrl(file)" :alt="`选择原图 ${file.original_name}`" /><span>{{ file.original_name }}</span></button></div></section>
+
       <template v-if="batch.ocr?.status === 'completed'">
         <section v-if="!isAiRecognition(batch.ocr)" class="ai-assist-card" aria-labelledby="ai-assist-heading">
           <div class="ai-assist-copy"><div class="ai-icon"><Sparkles :size="19" /></div><div><div class="section-heading"><div><p class="eyebrow">可选步骤</p><h2 id="ai-assist-heading">AI 补全 OCR</h2></div><span>{{ aiLabel(batch.ocr.ai_status) }}</span></div><p>如果本地 OCR 漏了手写字、公式或小问，可以把原图和 OCR 初稿交给你配置的视觉模型复核。AI 结果会单独显示，确认后才会替换题目初稿。</p></div></div>
@@ -136,7 +205,7 @@ onBeforeUnmount(clearRefreshTimer)
           <p v-if="batch.ocr.ai_status === 'failed'" class="ai-error" role="alert">{{ batch.ocr.ai_error_message || 'AI 复核未完成，请检查设置或服务商返回。' }}</p>
           <template v-if="batch.ocr.ai_status === 'completed' && batch.ocr.ai_text"><details class="ai-result" open><summary>查看 AI 复核结果</summary><pre>{{ batch.ocr.ai_text }}</pre></details><button class="apply-ai-button" type="button" :disabled="isRequestingAi" @click="applyAiAssist"><CheckCircle2 :size="17" />采用 AI 初稿并重新生成题目</button></template>
         </section>
-        <QuestionEditor v-for="question in batch.questions" :key="question.id" :batch-id="batch.id" :question="question" @saved="updateQuestion" @finished="emit('back')" />
+        <QuestionEditor v-for="question in batch.questions" :key="question.id" :batch-id="batch.id" :question="question" :can-add-figure="imageFiles.length > 0" @saved="updateQuestion" @finished="emit('back')" @add-figure="startFigureCapture(question.id)" @remove-figure="removeFigure(question.id, $event)" />
         <section v-if="!batch.questions.length" class="ocr-result" aria-labelledby="ocr-result-heading"><div class="section-heading"><div><p class="eyebrow">OCR 初稿</p><h2 id="ocr-result-heading">识别出的文字</h2></div><span>{{ batch.ocr.engine }}</span></div><p class="empty-draft">正在生成可编辑题目，请稍后刷新。</p></section>
         <details class="ocr-raw"><summary>查看{{ recognitionName(batch.ocr) }}原始文字</summary><pre>{{ batch.ocr.text || '没有识别出可编辑文字，请检查图片清晰度后重试。' }}</pre></details>
       </template>
@@ -148,12 +217,14 @@ onBeforeUnmount(clearRefreshTimer)
 
       <p v-if="batch.note" class="note"><strong>上传备注</strong>{{ batch.note }}</p>
     </template>
+    <ImageCropper v-if="figureCropFile" :file="figureCropFile" :initial-region="null" @cancel="clearFigureCapture" @confirm="saveFigure" />
   </section>
 </template>
 
 <style scoped>
 .review-page { max-width: 1200px; margin: 0 auto; padding: 32px 44px 56px; }.back-button { display: inline-flex; align-items: center; gap: 7px; min-height: 44px; padding: 0; color: #315f9b; border: 0; background: transparent; font-size: 13px; font-weight: 700; }.review-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-top: 18px; }.eyebrow { margin: 0 0 7px; color: #7189a3; font-size: 12px; font-weight: 700; letter-spacing: .4px; }.review-heading h1 { margin: 0; color: #1e3553; font-size: 31px; letter-spacing: -.7px; }.review-heading p:last-child { margin: 10px 0 0; color: #687f97; font-size: 13px; }.status-chip,.section-heading > span { flex: 0 0 auto; padding: 5px 8px; color: #92651e; border-radius: 6px; background: #fff4d7; font-size: 11px; font-weight: 700; }.review-tip { display: flex; align-items: flex-start; gap: 11px; margin-top: 26px; padding: 17px; color: #405f80; border: 1px solid #cfe1f4; border-radius: 12px; background: #f5faff; }.review-tip > svg { flex: 0 0 auto; margin-top: 1px; color: #3975cf; }.review-tip > div { flex: 1; }.review-tip strong { font-size: 13px; }.review-tip p { margin: 5px 0 0; color: #66809a; font-size: 12px; line-height: 1.6; }.ocr-button,.ocr-failed button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 42px; padding: 9px 12px; color: #fff; border: 0; border-radius: 8px; background: #f97316; font-size: 12px; font-weight: 700; }.ocr-button:disabled { cursor: wait; opacity: .65; }.ocr-progress { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; min-height: 42px; color: #486a90; font-size: 12px; font-weight: 700; }.ocr-result,.ocr-failed,.preview-section,.file-section,.ocr-raw { margin-top: 27px; padding: 22px; background: #fff; border: 1px solid #dce5ef; border-radius: 13px; }.ocr-result pre,.ocr-raw pre { max-height: 330px; margin: 14px 0 0; padding: 15px; overflow: auto; color: #344e69; border-radius: 9px; background: #f6f9fc; font: 13px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }.ocr-raw { padding: 0; overflow: hidden; }.ocr-raw summary { min-height: 44px; padding: 14px 18px; color: #42617f; font-size: 13px; font-weight: 700; cursor: pointer; }.ocr-raw pre { margin: 0 16px 16px; }.empty-draft { margin: 0; color: #5d7690; font-size: 13px; }.ocr-failed { display: flex; align-items: flex-start; gap: 10px; color: #b04b3d; border-color: #f0d0ca; background: #fffaf9; }.ocr-failed > div { flex: 1; }.ocr-failed strong { color: #864034; font-size: 13px; }.ocr-failed p { margin: 5px 0 0; color: #8d625b; font-size: 12px; line-height: 1.55; }.ocr-failed button { color: #ad493b; background: #fff; border: 1px solid #e1aaa0; }.section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 17px; }.section-heading h2 { margin: 0; color: #29435f; font-size: 18px; }.section-heading > span { color: #527395; background: #eef5fd; }.image-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px; }.image-card { overflow: hidden; color: inherit; border: 1px solid #dfe8f1; border-radius: 10px; background: #fbfdff; text-decoration: none; transition: border-color .2s ease, box-shadow .2s ease; }.image-card:hover { border-color: #92b7e4; box-shadow: 0 5px 14px rgba(39,90,158,.1); }.image-card img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #eef3f8; }.image-card span { display: block; overflow: hidden; padding: 10px; color: #526d89; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }.file-list { display: grid; gap: 9px; }.file-list a { display: flex; align-items: center; gap: 11px; min-height: 62px; padding: 10px; color: inherit; border: 1px solid #e0e8f0; border-radius: 9px; text-decoration: none; transition: border-color .2s ease, background .2s ease; }.file-list a:hover { border-color: #a9c6e9; background: #f8fbff; }.file-icon { display: grid; width: 38px; height: 38px; place-items: center; color: #3975cf; background: #eaf3ff; border-radius: 9px; }.file-list div:last-child { display: grid; gap: 4px; min-width: 0; }.file-list strong { overflow: hidden; color: #36506c; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }.file-list small { color: #8092a4; font-size: 11px; }.note { display: grid; gap: 6px; margin: 18px 2px 0; color: #617891; font-size: 13px; line-height: 1.6; }.note strong { color: #3e5874; font-size: 12px; }.review-loading,.review-error { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 230px; margin-top: 20px; color: #5c748d; background: #fff; border: 1px solid #dce5ef; border-radius: 13px; }.review-error { justify-content: flex-start; padding: 24px; color: #ad4e40; }.review-error div { display: grid; gap: 5px; flex: 1; }.review-error strong { color: #394f68; }.review-error p { margin: 0; color: #6d8298; font-size: 13px; }.review-error button { display: inline-flex; align-items: center; gap: 6px; min-height: 40px; padding: 8px 11px; color: #2d64ba; border: 1px solid #b7cfed; border-radius: 8px; background: #fff; font-weight: 700; }.spin { animation: rotate .8s linear infinite; }@keyframes rotate { to { transform: rotate(360deg); } }@media (max-width: 760px) { .review-page { padding: 22px 17px 42px; }.review-heading { align-items: flex-start; flex-direction: column; gap: 12px; }.review-heading h1 { font-size: 27px; }.review-tip,.ocr-result,.ocr-failed,.preview-section,.file-section,.ocr-raw { margin-top: 18px; }.ocr-result,.ocr-failed,.preview-section,.file-section { padding: 17px; }.review-tip { flex-wrap: wrap; }.ocr-button,.ocr-progress { width: 100%; }.image-grid { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; }.review-error { align-items: flex-start; flex-wrap: wrap; }.review-error button { margin-left: 34px; } }@media (prefers-reduced-motion: reduce) { .spin { animation: none; }.image-card,.file-list a { transition: none; } }
 .status-chip.confirmed { color: #23785d; background: #e8f7f0; }
+.figure-source-picker { display: grid; grid-template-columns: 1fr auto; gap: 12px; margin-top: 20px; padding: 18px; border: 1px solid #b9d7f1; border-radius: 12px; background: #f6fbff; }.figure-source-picker h2 { margin: 0; color: #294f78; font-size: 17px; }.figure-source-picker p:last-child { margin: 6px 0 0; color: #617b95; font-size: 12px; line-height: 1.55; }.figure-source-picker > button { align-self: start; min-height: 40px; padding: 8px 11px; color: #526e89; border: 1px solid #c9d9e8; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }.figure-source-list { display: grid; grid-column: 1 / -1; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; }.figure-source-list button { display: grid; min-width: 0; overflow: hidden; padding: 0; color: #496784; border: 1px solid #d5e3ef; border-radius: 9px; background: #fff; text-align: left; cursor: pointer; transition: border-color .18s ease, box-shadow .18s ease; }.figure-source-list button:hover { border-color: #6fa1dc; box-shadow: 0 3px 10px rgba(45,94,157,.12); }.figure-source-list img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #e8eef4; }.figure-source-list span { overflow: hidden; padding: 8px; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }@media (max-width: 760px) { .figure-source-picker { grid-template-columns: 1fr; }.figure-source-picker > button { width: 100%; }.figure-source-list { grid-template-columns: repeat(2,minmax(0,1fr)); } }@media (prefers-reduced-motion: reduce) { .figure-source-list button { transition: none; } }
 .ai-assist-card { margin-top: 27px; padding: 20px 22px; color: #385571; border: 1px solid #ddd4f7; border-radius: 13px; background: #fbfaff; }
 .ai-assist-copy { display: flex; gap: 12px; }
 .ai-icon { display: grid; width: 38px; height: 38px; flex: 0 0 auto; place-items: center; color: #7558d5; border-radius: 10px; background: #eee8ff; }

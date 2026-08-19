@@ -155,6 +155,7 @@ class MistakeQuestion(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     batch: Mapped[UploadBatch] = relationship(back_populates="questions")
     parts: Mapped[list["QuestionPart"]] = relationship(back_populates="question", cascade="all, delete-orphan")
+    figures: Mapped[list["QuestionFigure"]] = relationship(back_populates="question", cascade="all, delete-orphan")
 
 
 class QuestionPart(Base):
@@ -175,6 +176,18 @@ class QuestionPart(Base):
     difficulty: Mapped[int] = mapped_column(Integer, default=3)
     error_type: Mapped[str] = mapped_column(String(32), default="")
     question: Mapped[MistakeQuestion] = relationship(back_populates="parts")
+
+
+class QuestionFigure(Base):
+    __tablename__ = "question_figures"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    question_id: Mapped[str] = mapped_column(ForeignKey("mistake_questions.id"), index=True)
+    source_file_id: Mapped[str] = mapped_column(ForeignKey("uploaded_files.id"), index=True)
+    stored_name: Mapped[str] = mapped_column(String(255), unique=True)
+    position: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    question: Mapped[MistakeQuestion] = relationship(back_populates="figures")
 
 
 class PrintTemplate(Base):
@@ -334,6 +347,19 @@ class QuestionOption(BaseModel):
     text: str
 
 
+class QuestionFigureResponse(BaseModel):
+    id: str
+    position: int
+
+
+class QuestionFigureCreateRequest(BaseModel):
+    file_id: str
+    x: float = 0
+    y: float = 0
+    width: float = 1
+    height: float = 1
+
+
 class QuestionPartPayload(BaseModel):
     id: str = ""
     parent_id: str | None = None
@@ -362,6 +388,7 @@ class MistakeQuestionResponse(BaseModel):
     difficulty: int
     error_type: str
     parts: list[QuestionPartPayload]
+    figures: list[QuestionFigureResponse]
     status: str
     updated_at: datetime
 
@@ -655,6 +682,7 @@ def to_question_response(question: MistakeQuestion) -> MistakeQuestionResponse:
         difficulty=question.difficulty,
         error_type=question.error_type,
         parts=[to_question_part_payload(part) for part in sorted(question.parts, key=lambda item: item.position)],
+        figures=[QuestionFigureResponse(id=figure.id, position=figure.position) for figure in sorted(question.figures, key=lambda item: item.position)],
         status=question.status,
         updated_at=question.updated_at,
     )
@@ -1933,6 +1961,97 @@ def get_uploaded_file(batch_id: str, file_id: str, user: AppUser = Depends(requi
     if not path.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原始文件已不存在。")
     return FileResponse(path, media_type=file.content_type)
+
+
+def normalized_figure_box(payload: QuestionFigureCreateRequest) -> tuple[float, float, float, float]:
+    values = (payload.x, payload.y, payload.width, payload.height)
+    if not all(math.isfinite(value) for value in values) or payload.x < 0 or payload.y < 0 or payload.width < 0.03 or payload.height < 0.03 or payload.x + payload.width > 1.0001 or payload.y + payload.height > 1.0001:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="题图截取范围无效，请重新框选图形区域。")
+    return values
+
+
+@app.post("/api/mistakes/{batch_id}/questions/{question_id}/figures", response_model=MistakeQuestionResponse, status_code=status.HTTP_201_CREATED)
+def create_question_figure(batch_id: str, question_id: str, payload: QuestionFigureCreateRequest, user: AppUser = Depends(require_user)) -> MistakeQuestionResponse:
+    crop_x, crop_y, crop_width, crop_height = normalized_figure_box(payload)
+    with SessionLocal() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        question = session.get(MistakeQuestion, question_id)
+        file = session.get(UploadedFile, payload.file_id)
+        if question is None or question.batch_id != batch.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+        if file is None or file.batch_id != batch.id or not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请选择这道错题的原始图片。")
+        source_path = storage_root / "uploads" / batch.id / file.stored_name
+        figure_id = str(uuid4())
+        stored_name = f"{figure_id}.png"
+        figure_path = storage_root / "uploads" / batch.id / "figures" / stored_name
+        next_position = max((figure.position for figure in question.figures), default=0) + 1
+
+    if not source_path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原始图片已不存在，无法截取题图。")
+    try:
+        from PIL import Image, ImageOps
+
+        figure_path.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(source_path) as image:
+            source = ImageOps.exif_transpose(image).convert("RGB")
+            left = max(0, min(source.width - 1, round(source.width * crop_x)))
+            top = max(0, min(source.height - 1, round(source.height * crop_y)))
+            right = max(left + 1, min(source.width, round(source.width * (crop_x + crop_width))))
+            bottom = max(top + 1, min(source.height, round(source.height * (crop_y + crop_height))))
+            source.crop((left, top, right, bottom)).save(figure_path, "PNG", optimize=True)
+    except Exception as error:
+        figure_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="无法截取这张图片，请改用 JPG、PNG 或 WebP 原图。") from error
+
+    try:
+        with SessionLocal.begin() as session:
+            question = session.get(MistakeQuestion, question_id)
+            if question is None or question.batch_id != batch_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+            session.add(QuestionFigure(id=figure_id, question_id=question.id, source_file_id=payload.file_id, stored_name=stored_name, position=next_position))
+        with SessionLocal() as session:
+            question = session.get(MistakeQuestion, question_id)
+            if question is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+            return to_question_response(question)
+    except Exception:
+        figure_path.unlink(missing_ok=True)
+        raise
+
+
+@app.get("/api/mistakes/{batch_id}/questions/{question_id}/figures/{figure_id}")
+def get_question_figure(batch_id: str, question_id: str, figure_id: str, user: AppUser = Depends(require_user)) -> FileResponse:
+    with SessionLocal() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        figure = session.get(QuestionFigure, figure_id)
+        if figure is None or figure.question_id != question_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到题图。")
+        question = session.get(MistakeQuestion, question_id)
+        if question is None or question.batch_id != batch.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到题图。")
+        path = storage_root / "uploads" / batch.id / "figures" / figure.stored_name
+    if not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="题图文件已不存在。")
+    return FileResponse(path, media_type="image/png")
+
+
+@app.delete("/api/mistakes/{batch_id}/questions/{question_id}/figures/{figure_id}", response_model=MistakeQuestionResponse)
+def delete_question_figure(batch_id: str, question_id: str, figure_id: str, user: AppUser = Depends(require_user)) -> MistakeQuestionResponse:
+    with SessionLocal.begin() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        figure = session.get(QuestionFigure, figure_id)
+        question = session.get(MistakeQuestion, question_id)
+        if figure is None or question is None or figure.question_id != question.id or question.batch_id != batch.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到题图。")
+        path = storage_root / "uploads" / batch.id / "figures" / figure.stored_name
+        session.delete(figure)
+    path.unlink(missing_ok=True)
+    with SessionLocal() as session:
+        question = session.get(MistakeQuestion, question_id)
+        if question is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+        return to_question_response(question)
 
 
 @app.post("/api/mistakes/{batch_id}/ocr", response_model=OcrRunResponse, status_code=status.HTTP_202_ACCEPTED)

@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { ArrowLeft, CheckCircle2, CircleAlert, Eraser, FileImage, FileText, ImageOff, Info, LoaderCircle, RefreshCw, ScanText, Sparkles, Trash2, WandSparkles } from '@lucide/vue'
+import { ArrowLeft, CheckCircle2, CircleAlert, Eraser, FileImage, FileText, ImageOff, Info, LoaderCircle, RefreshCw, ScanText, Sparkles, Trash2, WandSparkles, X } from '@lucide/vue'
 import QuestionEditor from './QuestionEditor.vue'
 import ImageCropper, { type CropRegion } from './ImageCropper.vue'
 import type { MistakeQuestion } from '../types/questions'
 
-type CleanImage = { id: string; created_at: string }
+type CleanImage = { id: string; created_at: string; approved_at: string | null }
 type UploadedFile = { id: string; original_name: string; content_type: string; size: number; clean_image: CleanImage | null }
 type OcrRun = { engine: string; status: string; text: string; error_message: string; started_at: string | null; completed_at: string | null; ai_status: string; ai_text: string; ai_error_message: string; ai_model: string; ai_started_at: string | null; ai_completed_at: string | null }
 type BatchDetail = { id: string; subject: string; source: string; note: string; status: string; created_at: string; file_count: number; files: UploadedFile[]; ocr: OcrRun | null; questions: MistakeQuestion[] }
@@ -19,6 +19,8 @@ const isRequestingAi = ref(false)
 const aiConfigured = ref(false)
 const imageEditConfigured = ref(false)
 const cleaningFileId = ref('')
+const approvingFileId = ref('')
+const compareFile = ref<UploadedFile | null>(null)
 const errorMessage = ref('')
 const figureTargetQuestionId = ref('')
 const figureSource = ref<UploadedFile | null>(null)
@@ -30,6 +32,7 @@ let refreshTimer: number | undefined
 
 const imageFiles = computed(() => batch.value?.files.filter((file) => file.content_type.startsWith('image/') && !['image/heic', 'image/heif'].includes(file.content_type)) ?? [])
 const otherFiles = computed(() => batch.value?.files.filter((file) => !imageFiles.value.some((image) => image.id === file.id)) ?? [])
+const isCleanWorkflowRunning = computed(() => isCleanWorkflow(batch.value?.ocr) && ['queued', 'running'].includes(batch.value?.ocr?.status ?? ''))
 
 function formatSize(size: number) { return size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / 1024 / 1024).toFixed(1)} MB` }
 function formatDate(value: string) { return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) }
@@ -113,6 +116,24 @@ async function deleteCleanImage(file: UploadedFile) {
     replaceFile({ ...file, clean_image: null })
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '无法删除清洁图。'
+  }
+}
+
+async function approveCleanImage(file: UploadedFile) {
+  if (!file.clean_image || approvingFileId.value) return
+  approvingFileId.value = file.id
+  errorMessage.value = ''
+  try {
+    const response = await fetch(`/api/mistakes/${props.batchId}/files/${file.id}/clean-image/approve`, { method: 'POST' })
+    const payload = await response.json().catch(() => ({ detail: '确认清洁图失败，请稍后重试。' }))
+    if (!response.ok) throw new Error(payload.detail)
+    replaceFile(payload)
+    if (compareFile.value?.id === file.id) compareFile.value = payload
+    if (batch.value && imageFiles.value.every((item) => item.id === file.id ? Boolean(payload.clean_image?.approved_at) : Boolean(item.clean_image?.approved_at))) batch.value.status = 'confirmed'
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '确认清洁图失败，请稍后重试。'
+  } finally {
+    approvingFileId.value = ''
   }
 }
 
@@ -301,12 +322,13 @@ onBeforeUnmount(clearRefreshTimer)
       </template>
       <section v-else-if="batch.ocr?.status === 'failed'" class="ocr-failed" role="alert"><CircleAlert :size="19" /><div><strong>{{ recognitionName(batch.ocr) }}未完成</strong><p>{{ batch.ocr.error_message || '请检查识别设置、网络和文件格式后重试。' }}</p></div><button type="button" @click="startOcr(false)"><RefreshCw :size="16" />重试</button></section>
 
-      <section v-if="imageFiles.length" class="preview-section" aria-labelledby="preview-heading"><div class="section-heading"><div><p class="eyebrow">原图与清洁打印图</p><h2 id="preview-heading">先核对，再决定是否使用</h2></div><span>{{ imageFiles.length }} 张</span></div><p class="clean-intro">“去除笔迹”只会新建一张清洁打印图，原始照片始终保留。AI 无法可靠还原被笔迹完全遮住的印刷内容，请打开清洁图对照原图后再打印。</p><p v-if="!imageEditConfigured" class="clean-unavailable">尚未启用图片修复模型。请先前往 AI 设置，加载模型后在“图片修复模型”中选择包含 image 的模型并保存。</p><div class="image-grid"><article v-for="file in imageFiles" :key="file.id" class="image-card"><a class="image-link" :href="fileUrl(file)" target="_blank" rel="noreferrer"><img :src="fileUrl(file)" :alt="`原图：${file.original_name}`" /><span>原图 · {{ file.original_name }}</span></a><div class="image-actions"><button class="clean-button" type="button" :disabled="Boolean(cleaningFileId) || !imageEditConfigured" @click="createCleanImage(file)"><LoaderCircle v-if="cleaningFileId === file.id" class="spin" :size="16" /><Eraser v-else :size="16" />{{ cleaningFileId === file.id ? '正在去除笔迹…' : file.clean_image ? '重新生成清洁图' : '去除笔迹' }}</button></div><div v-if="file.clean_image" class="clean-result"><a :href="cleanImageUrl(file)" target="_blank" rel="noreferrer"><img :src="cleanImageUrl(file)" :alt="`清洁打印图：${file.original_name}`" /><span>清洁打印图 · 点击核对</span></a><button class="delete-clean-button" type="button" @click="deleteCleanImage(file)"><Trash2 :size="15" />删除清洁图</button></div></article></div></section>
+      <section v-if="imageFiles.length" class="preview-section" aria-labelledby="preview-heading"><div class="section-heading"><div><p class="eyebrow">原图与清洁打印图</p><h2 id="preview-heading">原图与结果并排核对</h2></div><span>{{ imageFiles.length }} 张</span></div><p class="clean-intro">先检查题干、数字、公式、表格和图形是否完整；确认无误后，点击“确认此清洁图可用”。原图始终保留。</p><p v-if="!imageEditConfigured" class="clean-unavailable">尚未启用图片修复模型。请先前往 AI 设置，加载模型后在“图片修复模型”中选择包含 image 的模型并保存。</p><div class="image-grid"><article v-for="file in imageFiles" :key="file.id" class="image-card" :class="{ paired: Boolean(file.clean_image) }"><div class="image-original"><a class="image-link" :href="fileUrl(file)" target="_blank" rel="noreferrer"><img :src="fileUrl(file)" :alt="`原图：${file.original_name}`" /><span>原图 · {{ file.original_name }}</span></a><div v-if="isCleanWorkflowRunning" class="clean-progress"><LoaderCircle class="spin" :size="16" />{{ file.clean_image ? '正在处理其余原图…' : '正在自动去除笔迹…' }}</div><div v-else class="image-actions"><button class="clean-button" type="button" :disabled="Boolean(cleaningFileId) || !imageEditConfigured" @click="createCleanImage(file)"><LoaderCircle v-if="cleaningFileId === file.id" class="spin" :size="16" /><Eraser v-else :size="16" />{{ cleaningFileId === file.id ? '正在去除笔迹…' : file.clean_image ? '重新生成清洁图' : '去除笔迹' }}</button></div></div><div v-if="file.clean_image" class="clean-result"><a :href="cleanImageUrl(file)" target="_blank" rel="noreferrer"><img :src="cleanImageUrl(file)" :alt="`清洁打印图：${file.original_name}`" /><span>清洁打印图</span></a><div class="clean-result-actions"><button class="compare-button" type="button" @click="compareFile = file">原图与结果对照</button><button v-if="!file.clean_image.approved_at" class="approve-button" type="button" :disabled="Boolean(approvingFileId)" @click="approveCleanImage(file)"><LoaderCircle v-if="approvingFileId === file.id" class="spin" :size="16" /><CheckCircle2 v-else :size="16" />{{ approvingFileId === file.id ? '正在确认…' : '确认此清洁图可用' }}</button><p v-else class="approved-status"><CheckCircle2 :size="16" />已确认清洁图</p><button class="delete-clean-button" type="button" @click="deleteCleanImage(file)"><Trash2 :size="15" />删除清洁图</button></div></div></article></div></section>
 
       <section v-if="otherFiles.length" class="file-section" aria-labelledby="file-heading"><div class="section-heading"><div><p class="eyebrow">其他原始文件</p><h2 id="file-heading">PDF 与暂不支持预览的图片</h2></div><span>{{ otherFiles.length }} 个</span></div><div class="file-list"><a v-for="file in otherFiles" :key="file.id" :href="fileUrl(file)" target="_blank" rel="noreferrer"><div class="file-icon"><FileText v-if="file.content_type === 'application/pdf'" :size="20" /><FileImage v-else :size="20" /></div><div><strong>{{ file.original_name }}</strong><small>{{ formatSize(file.size) }} · 点击打开原文件</small></div></a></div></section>
 
       <p v-if="batch.note" class="note"><strong>上传备注</strong>{{ batch.note }}</p>
     </template>
+    <div v-if="compareFile?.clean_image" class="compare-overlay" role="dialog" aria-modal="true" aria-label="原图与清洁图对照" @click.self="compareFile = null"><section class="compare-dialog"><header><div><p class="eyebrow">核对图片</p><h2>原图与清洁图</h2><p>重点检查题干、数字、公式、图形和表格有没有遗漏或被改动。</p></div><button type="button" aria-label="关闭对照" @click="compareFile = null"><X :size="20" /></button></header><div class="compare-images"><figure><figcaption>原图</figcaption><img :src="fileUrl(compareFile)" :alt="`原图：${compareFile.original_name}`" /></figure><figure><figcaption>清洁打印图</figcaption><img :src="cleanImageUrl(compareFile)" :alt="`清洁打印图：${compareFile.original_name}`" /></figure></div><footer><button class="secondary-compare-button" type="button" @click="compareFile = null">继续检查</button><button v-if="!compareFile.clean_image.approved_at" class="approve-button" type="button" :disabled="Boolean(approvingFileId)" @click="approveCleanImage(compareFile)"><CheckCircle2 :size="16" />确认此清洁图可用</button><p v-else class="approved-status"><CheckCircle2 :size="16" />已确认清洁图</p></footer></section></div>
     <ImageCropper v-if="figureCropFile" :file="figureCropFile" :initial-region="null" @cancel="clearFigureCapture" @confirm="saveFigure" />
   </section>
 </template>
@@ -350,4 +372,20 @@ onBeforeUnmount(clearRefreshTimer)
 .clean-result span { color: #26725b; }
 .delete-clean-button { width: calc(100% - 20px); margin: 0 10px 10px; color: #a34b3e; border: 1px solid #ecc6c0; border-radius: 8px; background: #fff; }
 .delete-clean-button:hover { background: #fff8f7; }
+.image-grid { grid-template-columns: 1fr; }
+.image-card.paired { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); }
+.image-original { min-width: 0; }
+.image-card.paired .clean-result { border-top: 0; border-left: 1px solid #dfe8f1; }
+.clean-progress { display: flex; min-height: 44px; align-items: center; justify-content: center; gap: 7px; margin: 0 10px 10px; color: #7253bb; border: 1px solid #d9cdf8; border-radius: 8px; background: #fbfaff; font-size: 12px; font-weight: 800; }
+.clean-result-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px; }
+.clean-result-actions .delete-clean-button { grid-column: 1 / -1; width: 100%; margin: 0; }
+.compare-button,.approve-button,.secondary-compare-button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 6px; padding: 8px 10px; border-radius: 8px; font-size: 12px; font-weight: 800; cursor: pointer; }
+.compare-button,.secondary-compare-button { color: #315f9b; border: 1px solid #b7cdea; background: #fff; }
+.compare-button:hover,.secondary-compare-button:hover { border-color: #7ea8d9; background: #f7fbff; }
+.approve-button { color: #fff; border: 1px solid #2b8a67; background: #2b8a67; }
+.approve-button:hover { background: #237657; }.approve-button:disabled { cursor: wait; opacity: .65; }
+.approved-status { display: flex; grid-column: 1 / -1; min-height: 44px; align-items: center; justify-content: center; gap: 6px; margin: 0; color: #237657; border: 1px solid #bfe3d4; border-radius: 8px; background: #f2fbf7; font-size: 12px; font-weight: 800; }
+.compare-overlay { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: 24px; overflow: auto; background: rgba(20,37,56,.56); }
+.compare-dialog { width: min(1100px,100%); max-height: calc(100dvh - 48px); overflow: auto; border-radius: 14px; background: #fff; box-shadow: 0 18px 58px rgba(12,26,43,.32); }.compare-dialog header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 22px 24px 18px; border-bottom: 1px solid #e2e9f0; }.compare-dialog h2 { margin: 0; color: #29435f; font-size: 20px; }.compare-dialog header p:last-child { max-width: 650px; margin: 6px 0 0; color: #688098; font-size: 12px; line-height: 1.6; }.compare-dialog header button { display: grid; width: 42px; height: 42px; flex: 0 0 auto; place-items: center; color: #526d89; border: 1px solid #d8e2eb; border-radius: 8px; background: #fff; cursor: pointer; }.compare-images { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 20px 24px; }.compare-images figure { min-width: 0; margin: 0; overflow: hidden; border: 1px solid #dbe5ee; border-radius: 10px; background: #f8fafc; }.compare-images figcaption { padding: 10px 12px; color: #435f7c; border-bottom: 1px solid #dbe5ee; background: #fff; font-size: 12px; font-weight: 800; }.compare-images img { display: block; width: 100%; max-height: 58dvh; object-fit: contain; background: #eef2f6; }.compare-dialog footer { display: flex; justify-content: flex-end; gap: 9px; padding: 0 24px 22px; }.compare-dialog footer .approved-status { width: auto; padding: 0 12px; }
+@media (max-width: 760px) { .image-grid { grid-template-columns: 1fr; }.image-card.paired { grid-template-columns: 1fr; }.image-card.paired .clean-result { border-top: 1px solid #dfe8f1; border-left: 0; }.compare-overlay { align-items: start; padding: 12px; }.compare-dialog { max-height: calc(100dvh - 24px); }.compare-dialog header,.compare-images,.compare-dialog footer { padding-right: 16px; padding-left: 16px; }.compare-images { grid-template-columns: 1fr; gap: 12px; }.compare-images img { max-height: none; }.compare-dialog footer { align-items: stretch; flex-direction: column; }.compare-dialog footer .approve-button,.compare-dialog footer .secondary-compare-button { width: 100%; }.compare-dialog footer .approved-status { width: auto; }.clean-result-actions { grid-template-columns: 1fr; }.approved-status { grid-column: auto; } }
 </style>

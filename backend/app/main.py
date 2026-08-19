@@ -126,6 +126,7 @@ class CleanImage(Base):
     batch_id: Mapped[str] = mapped_column(ForeignKey("upload_batches.id"), index=True)
     stored_name: Mapped[str] = mapped_column(String(255), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class OcrRun(Base):
@@ -261,6 +262,7 @@ class MistakeBatchResponse(BaseModel):
 class CleanImageResponse(BaseModel):
     id: str
     created_at: datetime
+    approved_at: datetime | None
 
 
 class UploadedFileResponse(BaseModel):
@@ -687,7 +689,7 @@ def to_uploaded_file_response(file: UploadedFile, clean_image: CleanImage | None
         original_name=file.original_name,
         content_type=file.content_type,
         size=file.size,
-        clean_image=None if clean_image is None else CleanImageResponse(id=clean_image.source_file_id, created_at=clean_image.created_at),
+        clean_image=None if clean_image is None else CleanImageResponse(id=clean_image.source_file_id, created_at=clean_image.created_at, approved_at=clean_image.approved_at),
     )
 
 
@@ -1568,8 +1570,9 @@ def persist_clean_image(batch_id: str, file_id: str, output: bytes) -> CleanImag
     previous_path: Path | None = None
     try:
         with SessionLocal.begin() as session:
+            batch = session.get(UploadBatch, batch_id)
             file = session.get(UploadedFile, file_id)
-            if file is None or file.batch_id != batch_id:
+            if batch is None or file is None or file.batch_id != batch_id:
                 raise RuntimeError("原始文件已不存在，无法保存清洁图。")
             existing = session.get(CleanImage, file_id)
             if existing is not None:
@@ -1577,6 +1580,9 @@ def persist_clean_image(batch_id: str, file_id: str, output: bytes) -> CleanImag
                 session.delete(existing)
             clean_image = CleanImage(source_file_id=file.id, batch_id=batch_id, stored_name=stored_name)
             session.add(clean_image)
+            # A regenerated image needs to be checked again before the batch is treated as confirmed.
+            if batch.status == "confirmed":
+                batch.status = "review_ready"
         if previous_path is not None:
             previous_path.unlink(missing_ok=True)
         return clean_image
@@ -1813,6 +1819,7 @@ def ensure_legacy_columns() -> None:
             ("ai_completed_at", "TIMESTAMP"),
         ],
         "ai_provider_configs": [("image_edit_model", "VARCHAR(128) NOT NULL DEFAULT ''")],
+        "clean_images": [("approved_at", "TIMESTAMP")],
     }
     with engine.begin() as connection:
         for table_name, additions in migrations.items():
@@ -2279,15 +2286,38 @@ def get_clean_image(batch_id: str, file_id: str, user: AppUser = Depends(require
     return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
+@app.post("/api/mistakes/{batch_id}/files/{file_id}/clean-image/approve", response_model=UploadedFileResponse)
+def approve_clean_image(batch_id: str, file_id: str, user: AppUser = Depends(require_user)) -> UploadedFileResponse:
+    with SessionLocal.begin() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        file = session.get(UploadedFile, file_id)
+        clean_image = session.get(CleanImage, file_id)
+        if file is None or file.batch_id != batch.id or clean_image is None or clean_image.batch_id != batch.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="请先生成这张原图的清洁打印图。")
+        clean_image.approved_at = datetime.now(timezone.utc)
+        image_files = [
+            item for item in batch.files
+            if item.content_type.startswith("image/") or Path(item.original_name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+        ]
+        approved_ids = set(session.scalars(select(CleanImage.source_file_id).where(CleanImage.batch_id == batch.id, CleanImage.approved_at.is_not(None))).all())
+        if image_files and all(item.id in approved_ids or item.id == file.id for item in image_files):
+            batch.status = "confirmed"
+        else:
+            batch.status = "review_ready"
+    return to_uploaded_file_response(file, clean_image)
+
+
 @app.delete("/api/mistakes/{batch_id}/files/{file_id}/clean-image")
 def delete_clean_image(batch_id: str, file_id: str, user: AppUser = Depends(require_user)) -> dict[str, str]:
     with SessionLocal.begin() as session:
-        get_owned_batch(session, batch_id, user.id)
+        batch = get_owned_batch(session, batch_id, user.id)
         clean_image = session.get(CleanImage, file_id)
         if clean_image is None or clean_image.batch_id != batch_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="这张原图还没有清洁打印图。")
         path = storage_root / "uploads" / batch_id / "clean" / clean_image.stored_name
         session.delete(clean_image)
+        if batch.status == "confirmed":
+            batch.status = "review_ready"
     path.unlink(missing_ok=True)
     return {"status": "deleted"}
 

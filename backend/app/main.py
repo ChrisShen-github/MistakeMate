@@ -107,6 +107,17 @@ class UploadedFile(Base):
     batch: Mapped[UploadBatch] = relationship(back_populates="files")
 
 
+class CleanImage(Base):
+    """An AI-produced print copy.  The uploaded original is never changed."""
+
+    __tablename__ = "clean_images"
+
+    source_file_id: Mapped[str] = mapped_column(ForeignKey("uploaded_files.id"), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("upload_batches.id"), index=True)
+    stored_name: Mapped[str] = mapped_column(String(255), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class OcrRun(Base):
     __tablename__ = "ocr_runs"
 
@@ -237,11 +248,17 @@ class MistakeBatchResponse(BaseModel):
     file_count: int
 
 
+class CleanImageResponse(BaseModel):
+    id: str
+    created_at: datetime
+
+
 class UploadedFileResponse(BaseModel):
     id: str
     original_name: str
     content_type: str
     size: int
+    clean_image: CleanImageResponse | None = None
 
 
 class OcrRunResponse(BaseModel):
@@ -643,6 +660,16 @@ def fetch_ai_models(base_url: str, api_key: str) -> list[str]:
     if not models:
         raise RuntimeError("服务没有返回可选模型。请检查接口是否兼容 OpenAI 的 /models 接口，或改用手动填写模型 ID。")
     return models
+
+
+def to_uploaded_file_response(file: UploadedFile, clean_image: CleanImage | None = None) -> UploadedFileResponse:
+    return UploadedFileResponse(
+        id=file.id,
+        original_name=file.original_name,
+        content_type=file.content_type,
+        size=file.size,
+        clean_image=None if clean_image is None else CleanImageResponse(id=clean_image.source_file_id, created_at=clean_image.created_at),
+    )
 
 
 def parse_string_list(value: str) -> list[str]:
@@ -1423,6 +1450,92 @@ def call_ai_chat(config: AiProviderConfig, messages: list[dict[str, Any]], max_t
     return content
 
 
+def make_multipart_image_edit_body(model: str, prompt: str, image_name: str, image_bytes: bytes) -> tuple[str, bytes]:
+    """Build the small multipart request used by the OpenAI-compatible Images Edit API."""
+    boundary = f"----MistakeMate{secrets.token_hex(16)}"
+    chunks: list[bytes] = []
+
+    def add_text(name: str, value: str) -> None:
+        chunks.extend((
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+            value.encode("utf-8"),
+            b"\r\n",
+        ))
+
+    add_text("model", model)
+    add_text("prompt", prompt)
+    add_text("output_format", "png")
+    add_text("quality", "high")
+    add_text("size", "auto")
+    chunks.extend((
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="image"; filename="{image_name}"\r\n'.encode(),
+        b"Content-Type: image/jpeg\r\n\r\n",
+        image_bytes,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ))
+    return boundary, b"".join(chunks)
+
+
+def call_ai_image_edit(config: AiProviderConfig, source_path: Path) -> bytes:
+    if not config.image_edit_model.strip():
+        raise RuntimeError("请先在 AI 设置中选择图片修复模型。")
+    api_key = decrypt_api_key(config.encrypted_api_key)
+    if not api_key:
+        raise RuntimeError("尚未配置 AI API 密钥。")
+
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(source_path) as image:
+            normalized = ImageOps.exif_transpose(image).convert("RGB")
+            # Keep readable print detail while avoiding unexpectedly huge AI uploads.
+            normalized.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+            with tempfile.SpooledTemporaryFile(max_size=10 * 1024 * 1024) as temporary_file:
+                normalized.save(temporary_file, "JPEG", quality=95, optimize=True)
+                temporary_file.seek(0)
+                prepared_image = temporary_file.read()
+    except Exception as error:
+        raise RuntimeError("无法读取这张图片，请改用 JPG、PNG 或 WebP 原图。") from error
+
+    prompt = (
+        "这是学生拍摄的试题图片。只移除学生用笔写下的答案、计算过程、勾画、圈画、涂改、红蓝笔笔迹；"
+        "必须保留所有原始印刷题干、数字、公式、表格、坐标轴、图形及图中标签。不要重新排版、不要改题、不要添加答案。"
+        "若笔迹遮挡的印刷内容无法确定，宁可保留局部痕迹，也不要猜测或凭空补写。"
+        "请输出一张清晰、适合打印、与原图构图尽量一致的试题图片。"
+    )
+    boundary, request_body = make_multipart_image_edit_body(
+        config.image_edit_model.strip(), prompt, "mistakemate-source.jpg", prepared_image
+    )
+    request = UrlRequest(
+        f"{config.base_url.rstrip('/')}/images/edits",
+        data=request_body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=180) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:800]
+        raise RuntimeError(f"图片修复服务返回 {error.code}：{detail}") from error
+    except (URLError, TimeoutError) as error:
+        raise RuntimeError(f"无法连接图片修复服务：{error}") from error
+    try:
+        encoded_image = payload["data"][0]["b64_json"]
+        output = base64.b64decode(encoded_image, validate=True)
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise RuntimeError("图片修复服务没有返回可保存的图片，请确认模型支持 OpenAI Images Edit。") from error
+    if not output:
+        raise RuntimeError("图片修复服务没有返回可保存的图片。")
+    return output
+
+
 def build_ai_ocr_messages(batch_id: str, local_ocr_text: str) -> list[dict[str, Any]]:
     prompt = (
         "请复核这些试题图片，并结合下面的本地 OCR 初稿，输出完整、可编辑的题面文字。"
@@ -1964,6 +2077,10 @@ def get_mistake_batch(batch_id: str, user: AppUser = Depends(require_user)) -> M
     with SessionLocal() as session:
         batch = get_owned_batch(session, batch_id, user.id)
         files = list(batch.files)
+        clean_images = {
+            item.source_file_id: item
+            for item in session.scalars(select(CleanImage).where(CleanImage.batch_id == batch.id)).all()
+        }
         ocr = to_ocr_response(session.get(OcrRun, batch_id))
         questions = sorted(list(batch.questions), key=lambda question: question.position)
         question_responses = [to_question_response(question) for question in questions]
@@ -1976,15 +2093,7 @@ def get_mistake_batch(batch_id: str, user: AppUser = Depends(require_user)) -> M
         status=batch.status,
         created_at=batch.created_at,
         file_count=len(files),
-        files=[
-            UploadedFileResponse(
-                id=file.id,
-                original_name=file.original_name,
-                content_type=file.content_type,
-                size=file.size,
-            )
-            for file in files
-        ],
+        files=[to_uploaded_file_response(file, clean_images.get(file.id)) for file in files],
         ocr=ocr,
         questions=question_responses,
     )
@@ -2002,6 +2111,84 @@ def get_uploaded_file(batch_id: str, file_id: str, user: AppUser = Depends(requi
     if not path.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原始文件已不存在。")
     return FileResponse(path, media_type=file.content_type)
+
+
+@app.post("/api/mistakes/{batch_id}/files/{file_id}/clean-image", response_model=UploadedFileResponse, status_code=status.HTTP_201_CREATED)
+def create_clean_image(batch_id: str, file_id: str, user: AppUser = Depends(require_user)) -> UploadedFileResponse:
+    """Generate a separate, AI-cleaned print copy; never modify the uploaded source."""
+    with SessionLocal() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        file = session.get(UploadedFile, file_id)
+        config = session.get(AiProviderConfig, user.id)
+        if file is None or file.batch_id != batch.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到原始文件。")
+        if not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="目前只能清除图片中的笔迹，PDF 请先转为图片上传。")
+        if config is None or not config.image_edit_model or not config.encrypted_api_key:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中选择图片修复模型并保存 API 密钥。")
+        source_path = storage_root / "uploads" / batch.id / file.stored_name
+        session.expunge(file)
+        session.expunge(config)
+
+    if not source_path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原始图片已不存在，无法去除笔迹。")
+    try:
+        output = call_ai_image_edit(config, source_path)
+    except RuntimeError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+    clean_directory = storage_root / "uploads" / batch_id / "clean"
+    clean_directory.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{uuid4()}.png"
+    output_path = clean_directory / stored_name
+    try:
+        output_path.write_bytes(output)
+    except OSError as error:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="清洁图写入失败，请检查数据目录是否可写。") from error
+
+    previous_path: Path | None = None
+    try:
+        with SessionLocal.begin() as session:
+            file = session.get(UploadedFile, file_id)
+            if file is None or file.batch_id != batch_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到原始文件。")
+            existing = session.get(CleanImage, file_id)
+            if existing is not None:
+                previous_path = clean_directory / existing.stored_name
+                session.delete(existing)
+            clean_image = CleanImage(source_file_id=file.id, batch_id=batch_id, stored_name=stored_name)
+            session.add(clean_image)
+        previous_path and previous_path.unlink(missing_ok=True)
+        return to_uploaded_file_response(file, clean_image)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+
+
+@app.get("/api/mistakes/{batch_id}/files/{file_id}/clean-image")
+def get_clean_image(batch_id: str, file_id: str, user: AppUser = Depends(require_user)) -> FileResponse:
+    with SessionLocal() as session:
+        get_owned_batch(session, batch_id, user.id)
+        clean_image = session.get(CleanImage, file_id)
+        if clean_image is None or clean_image.batch_id != batch_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="这张原图还没有清洁打印图。")
+        path = storage_root / "uploads" / batch_id / "clean" / clean_image.stored_name
+    if not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="清洁打印图已不存在。")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/api/mistakes/{batch_id}/files/{file_id}/clean-image")
+def delete_clean_image(batch_id: str, file_id: str, user: AppUser = Depends(require_user)) -> dict[str, str]:
+    with SessionLocal.begin() as session:
+        get_owned_batch(session, batch_id, user.id)
+        clean_image = session.get(CleanImage, file_id)
+        if clean_image is None or clean_image.batch_id != batch_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="这张原图还没有清洁打印图。")
+        path = storage_root / "uploads" / batch_id / "clean" / clean_image.stored_name
+        session.delete(clean_image)
+    path.unlink(missing_ok=True)
+    return {"status": "deleted"}
 
 
 def normalized_figure_box(payload: QuestionFigureCreateRequest) -> tuple[float, float, float, float]:

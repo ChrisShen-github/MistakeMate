@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { ArrowLeft, CheckCircle2, CircleAlert, FileImage, FileText, ImageOff, Info, LoaderCircle, RefreshCw, ScanText, Sparkles, WandSparkles } from '@lucide/vue'
+import { ArrowLeft, CheckCircle2, CircleAlert, Eraser, FileImage, FileText, ImageOff, Info, LoaderCircle, RefreshCw, ScanText, Sparkles, Trash2, WandSparkles } from '@lucide/vue'
 import QuestionEditor from './QuestionEditor.vue'
 import ImageCropper, { type CropRegion } from './ImageCropper.vue'
 import type { MistakeQuestion } from '../types/questions'
 
-type UploadedFile = { id: string; original_name: string; content_type: string; size: number }
+type CleanImage = { id: string; created_at: string }
+type UploadedFile = { id: string; original_name: string; content_type: string; size: number; clean_image: CleanImage | null }
 type OcrRun = { engine: string; status: string; text: string; error_message: string; started_at: string | null; completed_at: string | null; ai_status: string; ai_text: string; ai_error_message: string; ai_model: string; ai_started_at: string | null; ai_completed_at: string | null }
 type BatchDetail = { id: string; subject: string; source: string; note: string; status: string; created_at: string; file_count: number; files: UploadedFile[]; ocr: OcrRun | null; questions: MistakeQuestion[] }
 
@@ -16,6 +17,8 @@ const isLoading = ref(true)
 const isRequestingOcr = ref(false)
 const isRequestingAi = ref(false)
 const aiConfigured = ref(false)
+const imageEditConfigured = ref(false)
+const cleaningFileId = ref('')
 const errorMessage = ref('')
 const figureTargetQuestionId = ref('')
 const figureSource = ref<UploadedFile | null>(null)
@@ -31,6 +34,7 @@ const otherFiles = computed(() => batch.value?.files.filter((file) => !imageFile
 function formatSize(size: number) { return size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / 1024 / 1024).toFixed(1)} MB` }
 function formatDate(value: string) { return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) }
 function fileUrl(file: UploadedFile) { return `/api/mistakes/${props.batchId}/files/${file.id}` }
+function cleanImageUrl(file: UploadedFile) { return `/api/mistakes/${props.batchId}/files/${file.id}/clean-image` }
 function isAiRecognition(ocr?: OcrRun | null) { return ocr?.engine === 'AI 视觉识别' }
 function recognitionName(ocr?: OcrRun | null) { return isAiRecognition(ocr) ? 'AI 视觉识别' : '本地 OCR' }
 function ocrLabel(status?: string, ocr?: OcrRun | null) {
@@ -63,8 +67,51 @@ async function loadAiAvailability() {
     if (!response.ok) return
     const payload = await response.json()
     aiConfigured.value = Boolean(payload.model && payload.api_key_configured)
+    imageEditConfigured.value = Boolean(payload.image_edit_model && payload.api_key_configured)
   } catch {
     aiConfigured.value = false
+    imageEditConfigured.value = false
+  }
+}
+
+function replaceFile(updatedFile: UploadedFile) {
+  if (!batch.value) return
+  const index = batch.value.files.findIndex((file) => file.id === updatedFile.id)
+  if (index >= 0) batch.value.files.splice(index, 1, updatedFile)
+}
+
+async function createCleanImage(file: UploadedFile) {
+  if (cleaningFileId.value) return
+  if (!imageEditConfigured.value) {
+    errorMessage.value = '请先在 AI 设置中选择图片修复模型并保存。'
+    return
+  }
+  const action = file.clean_image ? '重新生成会替换当前清洁图，但绝不会覆盖原图。继续吗？' : '原图会发送给你配置的图片修复模型，只生成一张独立的清洁图。请先在生成后核对内容，再用于打印。继续吗？'
+  if (!window.confirm(action)) return
+  cleaningFileId.value = file.id
+  errorMessage.value = ''
+  try {
+    const response = await fetch(`/api/mistakes/${props.batchId}/files/${file.id}/clean-image`, { method: 'POST' })
+    const payload = await response.json().catch(() => ({ detail: '去除笔迹失败，请稍后重试。' }))
+    if (!response.ok) throw new Error(payload.detail)
+    replaceFile(payload)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '去除笔迹失败，请稍后重试。'
+  } finally {
+    cleaningFileId.value = ''
+  }
+}
+
+async function deleteCleanImage(file: UploadedFile) {
+  if (!file.clean_image || !window.confirm('删除这张清洁图吗？原图会保留，之后可以重新生成。')) return
+  errorMessage.value = ''
+  try {
+    const response = await fetch(`/api/mistakes/${props.batchId}/files/${file.id}/clean-image`, { method: 'DELETE' })
+    const payload = await response.json().catch(() => ({ detail: '无法删除清洁图。' }))
+    if (!response.ok) throw new Error(payload.detail)
+    replaceFile({ ...file, clean_image: null })
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '无法删除清洁图。'
   }
 }
 
@@ -253,7 +300,7 @@ onBeforeUnmount(clearRefreshTimer)
       </template>
       <section v-else-if="batch.ocr?.status === 'failed'" class="ocr-failed" role="alert"><CircleAlert :size="19" /><div><strong>{{ recognitionName(batch.ocr) }}未完成</strong><p>{{ batch.ocr.error_message || '请检查识别设置、网络和文件格式后重试。' }}</p></div><button type="button" @click="startOcr(false)"><RefreshCw :size="16" />重试</button></section>
 
-      <section v-if="imageFiles.length" class="preview-section" aria-labelledby="preview-heading"><div class="section-heading"><div><p class="eyebrow">原图预览</p><h2 id="preview-heading">可直接查看的图片</h2></div><span>{{ imageFiles.length }} 张</span></div><div class="image-grid"><a v-for="file in imageFiles" :key="file.id" class="image-card" :href="fileUrl(file)" target="_blank" rel="noreferrer"><img :src="fileUrl(file)" :alt="`原图：${file.original_name}`" /><span>{{ file.original_name }}</span></a></div></section>
+      <section v-if="imageFiles.length" class="preview-section" aria-labelledby="preview-heading"><div class="section-heading"><div><p class="eyebrow">原图与清洁打印图</p><h2 id="preview-heading">先核对，再决定是否使用</h2></div><span>{{ imageFiles.length }} 张</span></div><p class="clean-intro">“去除笔迹”只会新建一张清洁打印图，原始照片始终保留。AI 无法可靠还原被笔迹完全遮住的印刷内容，请打开清洁图对照原图后再打印。</p><p v-if="!imageEditConfigured" class="clean-unavailable">尚未启用图片修复模型。请先前往 AI 设置，加载模型后在“图片修复模型”中选择包含 image 的模型并保存。</p><div class="image-grid"><article v-for="file in imageFiles" :key="file.id" class="image-card"><a class="image-link" :href="fileUrl(file)" target="_blank" rel="noreferrer"><img :src="fileUrl(file)" :alt="`原图：${file.original_name}`" /><span>原图 · {{ file.original_name }}</span></a><div class="image-actions"><button class="clean-button" type="button" :disabled="Boolean(cleaningFileId) || !imageEditConfigured" @click="createCleanImage(file)"><LoaderCircle v-if="cleaningFileId === file.id" class="spin" :size="16" /><Eraser v-else :size="16" />{{ cleaningFileId === file.id ? '正在去除笔迹…' : file.clean_image ? '重新生成清洁图' : '去除笔迹' }}</button></div><div v-if="file.clean_image" class="clean-result"><a :href="cleanImageUrl(file)" target="_blank" rel="noreferrer"><img :src="cleanImageUrl(file)" :alt="`清洁打印图：${file.original_name}`" /><span>清洁打印图 · 点击核对</span></a><button class="delete-clean-button" type="button" @click="deleteCleanImage(file)"><Trash2 :size="15" />删除清洁图</button></div></article></div></section>
 
       <section v-if="otherFiles.length" class="file-section" aria-labelledby="file-heading"><div class="section-heading"><div><p class="eyebrow">其他原始文件</p><h2 id="file-heading">PDF 与暂不支持预览的图片</h2></div><span>{{ otherFiles.length }} 个</span></div><div class="file-list"><a v-for="file in otherFiles" :key="file.id" :href="fileUrl(file)" target="_blank" rel="noreferrer"><div class="file-icon"><FileText v-if="file.content_type === 'application/pdf'" :size="20" /><FileImage v-else :size="20" /></div><div><strong>{{ file.original_name }}</strong><small>{{ formatSize(file.size) }} · 点击打开原文件</small></div></a></div></section>
 
@@ -289,4 +336,17 @@ onBeforeUnmount(clearRefreshTimer)
 .reocr-button { display: inline-flex; min-height: 44px; flex: 0 0 auto; align-items: center; justify-content: center; gap: 6px; padding: 9px 12px; color: #315f9b; border: 1px solid #a9c6e9; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }
 .reocr-button:hover { color: #184f9f; border-color: #789fd3; background: #f7fbff; }
 @media (max-width: 760px) { .reocr-button { width: 100%; } .ai-assist-card { padding: 17px; } .ai-assist-actions,.ai-error,.ai-result,.apply-ai-button { margin-left: 0; } .ai-assist-actions { flex-wrap: wrap; } .ai-button { width: 100%; } .link-button { width: 100%; } }
+.clean-intro { max-width: 760px; margin: -5px 0 15px; color: #607992; font-size: 12px; line-height: 1.65; }
+.clean-unavailable { margin: 0 0 15px; padding: 10px 11px; color: #755b31; border: 1px solid #f0d99b; border-radius: 8px; background: #fff9e9; font-size: 12px; line-height: 1.55; }
+.image-link,.clean-result a { display: block; color: inherit; text-decoration: none; }
+.image-actions { padding: 0 10px 10px; }
+.clean-button,.delete-clean-button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 40px; font-size: 12px; font-weight: 800; cursor: pointer; }
+.clean-button { width: 100%; color: #5f42ba; border: 1px solid #cdbef1; border-radius: 8px; background: #fff; }
+.clean-button:hover { border-color: #9e84df; background: #faf8ff; }
+.clean-button:disabled { cursor: not-allowed; opacity: .55; }
+.clean-result { border-top: 1px solid #dfe8f1; background: #f8fbff; }
+.clean-result img { border-bottom: 1px solid #e0e8f1; }
+.clean-result span { color: #26725b; }
+.delete-clean-button { width: calc(100% - 20px); margin: 0 10px 10px; color: #a34b3e; border: 1px solid #ecc6c0; border-radius: 8px; background: #fff; }
+.delete-clean-button:hover { background: #fff8f7; }
 </style>

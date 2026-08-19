@@ -1391,8 +1391,10 @@ def call_ai_chat(config: AiProviderConfig, messages: list[dict[str, Any]], max_t
 def build_ai_ocr_messages(batch_id: str, local_ocr_text: str) -> list[dict[str, Any]]:
     prompt = (
         "请复核这些试题图片，并结合下面的本地 OCR 初稿，输出完整、可编辑的题面文字。"
-        "补全漏字，修正明显错字，保留题号、选项、小问、公式与换行。不要解题，不要添加答案，"
-        "不要解释；看不清的内容标记为［无法确认］。图片中有表格时，请使用标准 Markdown 表格（表头、分隔行、数据行），"
+        "补全漏字，修正明显错字，保留题号、选项、小问、公式与换行。数学公式使用 LaTeX：分数必须写成 \\frac{分子}{分母}，"
+        "不要写成 a/b 或 1/3 的横排形式。坐标轴、数轴、几何图、统计图、函数图、示意图和图中标注都是题面的一部分，"
+        "绝不能省略；若无法用文字精确重画，请单独写出“【题图需保留】”并逐项转写图上的刻度、坐标、文字、点和关系。"
+        "不要解题，不要添加答案，不要解释；看不清的内容标记为［无法确认］。图片中有表格时，请使用标准 Markdown 表格（表头、分隔行、数据行），"
         "不要用 ASCII 横线或空格模拟表格。\n\n本地 OCR 初稿：\n" + local_ocr_text[:16000]
     )
     return build_ai_image_messages(batch_id, prompt)
@@ -1401,8 +1403,11 @@ def build_ai_ocr_messages(batch_id: str, local_ocr_text: str) -> list[dict[str, 
 def build_direct_ai_ocr_messages(batch_id: str) -> list[dict[str, Any]]:
     prompt = (
         "请直接转写这些试题图片，输出完整、可编辑的题面文字。"
-        "保留题号、选项、小问、公式与换行。图片中有表格时，请使用标准 Markdown 表格（表头、分隔行、数据行），"
-        "不要用 ASCII 横线或空格模拟表格。不要解题，不要添加答案，不要解释；看不清的内容标记为［无法确认］。"
+        "保留题号、选项、小问、公式与换行。数学公式使用 LaTeX：分数必须写成 \\frac{分子}{分母}，"
+        "不要写成 a/b 或 1/3 的横排形式。坐标轴、数轴、几何图、统计图、函数图、示意图和图中标注都是题面的一部分，"
+        "绝不能省略；若无法用文字精确重画，请单独写出“【题图需保留】”并逐项转写图上的刻度、坐标、文字、点和关系。"
+        "图片中有表格时，请使用标准 Markdown 表格（表头、分隔行、数据行），不要用 ASCII 横线或空格模拟表格。"
+        "不要解题，不要添加答案，不要解释；看不清的内容标记为［无法确认］。"
     )
     return build_ai_image_messages(batch_id, prompt)
 

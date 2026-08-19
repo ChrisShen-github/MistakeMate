@@ -211,6 +211,7 @@ class AiProviderConfig(Base):
     user_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     base_url: Mapped[str] = mapped_column(String(512), default="https://api.openai.com/v1")
     model: Mapped[str] = mapped_column(String(128), default="")
+    image_edit_model: Mapped[str] = mapped_column(String(128), default="")
     encrypted_api_key: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -296,6 +297,7 @@ class LoginRequest(BaseModel):
 class AiConfigUpdateRequest(BaseModel):
     base_url: str = Field(min_length=8, max_length=512)
     model: str = Field(min_length=1, max_length=256)
+    image_edit_model: str = Field(default="", max_length=256)
     api_key: str = Field(default="", max_length=512)
     clear_api_key: bool = False
 
@@ -303,6 +305,7 @@ class AiConfigUpdateRequest(BaseModel):
 class AiConfigResponse(BaseModel):
     base_url: str
     model: str
+    image_edit_model: str
     api_key_configured: bool
     updated_at: datetime | None
 
@@ -1601,6 +1604,7 @@ def ensure_legacy_columns() -> None:
             ("ai_started_at", "TIMESTAMP"),
             ("ai_completed_at", "TIMESTAMP"),
         ],
+        "ai_provider_configs": [("image_edit_model", "VARCHAR(128) NOT NULL DEFAULT ''")],
     }
     with engine.begin() as connection:
         for table_name, additions in migrations.items():
@@ -1738,10 +1742,11 @@ def get_ai_config(user: AppUser = Depends(require_user)) -> AiConfigResponse:
     with SessionLocal() as session:
         config = session.get(AiProviderConfig, user.id)
         if config is None:
-            return AiConfigResponse(base_url="https://api.openai.com/v1", model="", api_key_configured=False, updated_at=None)
+            return AiConfigResponse(base_url="https://api.openai.com/v1", model="", image_edit_model="", api_key_configured=False, updated_at=None)
         return AiConfigResponse(
             base_url=config.base_url,
             model=config.model,
+            image_edit_model=config.image_edit_model,
             api_key_configured=bool(config.encrypted_api_key),
             updated_at=config.updated_at,
         )
@@ -1751,6 +1756,7 @@ def get_ai_config(user: AppUser = Depends(require_user)) -> AiConfigResponse:
 def save_ai_config(payload: AiConfigUpdateRequest, user: AppUser = Depends(require_user)) -> AiConfigResponse:
     base_url = normalize_ai_base_url(payload.base_url)
     model = payload.model.strip()
+    image_edit_model = payload.image_edit_model.strip()
     with SessionLocal.begin() as session:
         config = session.get(AiProviderConfig, user.id)
         if config is None:
@@ -1758,6 +1764,7 @@ def save_ai_config(payload: AiConfigUpdateRequest, user: AppUser = Depends(requi
             session.add(config)
         config.base_url = base_url
         config.model = model
+        config.image_edit_model = image_edit_model
         if payload.clear_api_key:
             config.encrypted_api_key = ""
         elif payload.api_key.strip():
@@ -1766,6 +1773,7 @@ def save_ai_config(payload: AiConfigUpdateRequest, user: AppUser = Depends(requi
     return AiConfigResponse(
         base_url=config.base_url,
         model=config.model,
+        image_edit_model=config.image_edit_model,
         api_key_configured=bool(config.encrypted_api_key),
         updated_at=config.updated_at,
     )

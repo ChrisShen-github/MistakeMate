@@ -360,6 +360,10 @@ class QuestionFigureCreateRequest(BaseModel):
     height: float = 1
 
 
+class QuestionFigureAutoExtractRequest(BaseModel):
+    file_id: str
+
+
 class QuestionPartPayload(BaseModel):
     id: str = ""
     parent_id: str | None = None
@@ -1421,7 +1425,7 @@ def build_ai_ocr_messages(batch_id: str, local_ocr_text: str) -> list[dict[str, 
         "请复核这些试题图片，并结合下面的本地 OCR 初稿，输出完整、可编辑的题面文字。"
         "补全漏字，修正明显错字，保留题号、选项、小问、公式与换行。数学公式使用 LaTeX：分数必须写成 \\frac{分子}{分母}，"
         "不要写成 a/b 或 1/3 的横排形式。坐标轴、数轴、几何图、统计图、函数图、示意图和图中标注都是题面的一部分，"
-        "绝不能省略；若无法用文字精确重画，请单独写出“【题图需保留】”并逐项转写图上的刻度、坐标、文字、点和关系。"
+        "绝不能省略；若无法用文字精确重画，请把图形说明单独包在“【题图需保留】”和“【题图描述结束】”之间，并逐项转写图上的刻度、坐标、文字、点和关系。"
         "不要解题，不要添加答案，不要解释；仅在确实看不清时标记为［无法确认：具体位置或候选内容］，不要笼统标记整题。图片中有表格时，请使用标准 Markdown 表格（表头、分隔行、数据行），"
         "不要用 ASCII 横线或空格模拟表格。\n\n本地 OCR 初稿：\n" + local_ocr_text[:16000]
     )
@@ -1433,7 +1437,7 @@ def build_direct_ai_ocr_messages(batch_id: str) -> list[dict[str, Any]]:
         "请直接转写这些试题图片，输出完整、可编辑的题面文字。"
         "保留题号、选项、小问、公式与换行。数学公式使用 LaTeX：分数必须写成 \\frac{分子}{分母}，"
         "不要写成 a/b 或 1/3 的横排形式。坐标轴、数轴、几何图、统计图、函数图、示意图和图中标注都是题面的一部分，"
-        "绝不能省略；若无法用文字精确重画，请单独写出“【题图需保留】”并逐项转写图上的刻度、坐标、文字、点和关系。"
+        "绝不能省略；若无法用文字精确重画，请把图形说明单独包在“【题图需保留】”和“【题图描述结束】”之间，并逐项转写图上的刻度、坐标、文字、点和关系。"
         "图片中有表格时，请使用标准 Markdown 表格（表头、分隔行、数据行），不要用 ASCII 横线或空格模拟表格。"
         "不要解题，不要添加答案，不要解释；仅在确实看不清时标记为［无法确认：具体位置或候选内容］，不要笼统标记整题。"
     )
@@ -1476,6 +1480,35 @@ def build_ai_image_messages(batch_id: str, prompt: str) -> list[dict[str, Any]]:
     return [
         {"role": "system", "content": "你是谨慎的中文试题 OCR 复核助手，只按图片内容转写。"},
         {"role": "user", "content": content},
+    ]
+
+
+def build_ai_figure_messages(batch_id: str, file: UploadedFile) -> list[dict[str, Any]]:
+    prompt = (
+        "请从这张试题原图中定位需要保留的题图，例如坐标轴、数轴、几何图、统计图、函数图、示意图或表格。"
+        "只返回严格 JSON，不要 Markdown、解释或代码块，格式为："
+        '{"figures":[{"x":0.10,"y":0.35,"width":0.70,"height":0.25}]}。'
+        "x、y、width、height 必须是相对原图左上角的 0 到 1 小数；裁切范围应包含图形本身及必要刻度、标签和题图内文字，"
+        "不要包含题干段落、孩子的手写笔记、勾画、答案或大面积空白。没有需要保留的题图时返回 {\"figures\":[]}。"
+    )
+    source = storage_root / "uploads" / batch_id / file.stored_name
+    if not source.is_file():
+        raise RuntimeError("原始图片已不存在。")
+    with tempfile.TemporaryDirectory(prefix="mistakemate-ai-figure-") as temporary_path:
+        compressed_path = Path(temporary_path) / "figure-source.jpg"
+        try:
+            from PIL import Image, ImageOps
+
+            with Image.open(source) as image:
+                prepared = ImageOps.exif_transpose(image).convert("RGB")
+                prepared.thumbnail((2600, 2600), Image.Resampling.LANCZOS)
+                prepared.save(compressed_path, "JPEG", quality=90, optimize=True)
+        except Exception as error:
+            raise RuntimeError("无法读取这张原图，请改用 JPG、PNG 或 WebP。") from error
+        encoded = base64.b64encode(compressed_path.read_bytes()).decode()
+    return [
+        {"role": "system", "content": "你是谨慎的试题版面分析助手，只返回所要求的 JSON。"},
+        {"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}", "detail": "high"}}]},
     ]
 
 
@@ -1970,38 +2003,89 @@ def normalized_figure_box(payload: QuestionFigureCreateRequest) -> tuple[float, 
     return values
 
 
-@app.post("/api/mistakes/{batch_id}/questions/{question_id}/figures", response_model=MistakeQuestionResponse, status_code=status.HTTP_201_CREATED)
-def create_question_figure(batch_id: str, question_id: str, payload: QuestionFigureCreateRequest, user: AppUser = Depends(require_user)) -> MistakeQuestionResponse:
-    crop_x, crop_y, crop_width, crop_height = normalized_figure_box(payload)
+def parse_ai_figure_regions(content: str) -> list[tuple[float, float, float, float]]:
+    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", content.strip(), flags=re.IGNORECASE)
+    start = cleaned.find("{")
+    if start < 0:
+        raise RuntimeError("AI 没有返回可用的题图位置。")
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+    except json.JSONDecodeError as error:
+        raise RuntimeError("AI 返回的题图位置格式不正确，请改用手动截取。") from error
+    figures = payload.get("figures") if isinstance(payload, dict) else None
+    if not isinstance(figures, list):
+        raise RuntimeError("AI 返回的题图位置格式不正确，请改用手动截取。")
+    regions: list[tuple[float, float, float, float]] = []
+    for figure in figures[:3]:
+        if not isinstance(figure, dict):
+            continue
+        try:
+            values = tuple(float(figure[key]) for key in ("x", "y", "width", "height"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        x, y, width, height = values
+        if not all(math.isfinite(value) for value in values) or x < 0 or y < 0 or width < 0.03 or height < 0.03 or x + width > 1.0001 or y + height > 1.0001:
+            continue
+        if any(abs(x - existing[0]) < .02 and abs(y - existing[1]) < .02 and abs(width - existing[2]) < .02 and abs(height - existing[3]) < .02 for existing in regions):
+            continue
+        regions.append((x, y, width, height))
+    return regions
+
+
+def strip_ai_figure_description(stem: str) -> str:
+    start = stem.find("【题图需保留】")
+    if start < 0:
+        return stem
+    end_marker = "【题图描述结束】"
+    end = stem.find(end_marker, start)
+    if end >= 0:
+        return (stem[:start].rstrip() + "\n" + stem[end + len(end_marker):].lstrip()).strip()
+    # 旧版识别结果没有结束标记。题图说明在旧版中一律位于题干末尾，裁出原图后直接移除它。
+    return stem[:start].rstrip()
+
+
+def save_question_figure_crops(
+    batch_id: str,
+    question_id: str,
+    file_id: str,
+    boxes: list[tuple[float, float, float, float]],
+    user: AppUser,
+) -> MistakeQuestionResponse:
+    if not boxes:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="没有可保存的题图，请手动截取需要保留的区域。")
     with SessionLocal() as session:
         batch = get_owned_batch(session, batch_id, user.id)
         question = session.get(MistakeQuestion, question_id)
-        file = session.get(UploadedFile, payload.file_id)
+        file = session.get(UploadedFile, file_id)
         if question is None or question.batch_id != batch.id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
         if file is None or file.batch_id != batch.id or not file.content_type.startswith("image/"):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请选择这道错题的原始图片。")
         source_path = storage_root / "uploads" / batch.id / file.stored_name
-        figure_id = str(uuid4())
-        stored_name = f"{figure_id}.png"
-        figure_path = storage_root / "uploads" / batch.id / "figures" / stored_name
-        next_position = max((figure.position for figure in question.figures), default=0) + 1
+        first_position = max((figure.position for figure in question.figures), default=0) + 1
 
     if not source_path.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原始图片已不存在，无法截取题图。")
+    saved_figures: list[tuple[str, str, Path, int]] = []
     try:
         from PIL import Image, ImageOps
 
-        figure_path.parent.mkdir(parents=True, exist_ok=True)
         with Image.open(source_path) as image:
             source = ImageOps.exif_transpose(image).convert("RGB")
-            left = max(0, min(source.width - 1, round(source.width * crop_x)))
-            top = max(0, min(source.height - 1, round(source.height * crop_y)))
-            right = max(left + 1, min(source.width, round(source.width * (crop_x + crop_width))))
-            bottom = max(top + 1, min(source.height, round(source.height * (crop_y + crop_height))))
-            source.crop((left, top, right, bottom)).save(figure_path, "PNG", optimize=True)
+            for index, (crop_x, crop_y, crop_width, crop_height) in enumerate(boxes):
+                figure_id = str(uuid4())
+                stored_name = f"{figure_id}.png"
+                figure_path = storage_root / "uploads" / batch_id / "figures" / stored_name
+                figure_path.parent.mkdir(parents=True, exist_ok=True)
+                left = max(0, min(source.width - 1, round(source.width * crop_x)))
+                top = max(0, min(source.height - 1, round(source.height * crop_y)))
+                right = max(left + 1, min(source.width, round(source.width * (crop_x + crop_width))))
+                bottom = max(top + 1, min(source.height, round(source.height * (crop_y + crop_height))))
+                source.crop((left, top, right, bottom)).save(figure_path, "PNG", optimize=True)
+                saved_figures.append((figure_id, stored_name, figure_path, first_position + index))
     except Exception as error:
-        figure_path.unlink(missing_ok=True)
+        for _, _, figure_path, _ in saved_figures:
+            figure_path.unlink(missing_ok=True)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="无法截取这张图片，请改用 JPG、PNG 或 WebP 原图。") from error
 
     try:
@@ -2009,15 +2093,48 @@ def create_question_figure(batch_id: str, question_id: str, payload: QuestionFig
             question = session.get(MistakeQuestion, question_id)
             if question is None or question.batch_id != batch_id:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
-            session.add(QuestionFigure(id=figure_id, question_id=question.id, source_file_id=payload.file_id, stored_name=stored_name, position=next_position))
+            for figure_id, stored_name, _, position in saved_figures:
+                session.add(QuestionFigure(id=figure_id, question_id=question.id, source_file_id=file_id, stored_name=stored_name, position=position))
+            question.stem = strip_ai_figure_description(question.stem)
+            question.updated_at = datetime.now(timezone.utc)
         with SessionLocal() as session:
             question = session.get(MistakeQuestion, question_id)
             if question is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
             return to_question_response(question)
     except Exception:
-        figure_path.unlink(missing_ok=True)
+        for _, _, figure_path, _ in saved_figures:
+            figure_path.unlink(missing_ok=True)
         raise
+
+
+@app.post("/api/mistakes/{batch_id}/questions/{question_id}/figures", response_model=MistakeQuestionResponse, status_code=status.HTTP_201_CREATED)
+def create_question_figure(batch_id: str, question_id: str, payload: QuestionFigureCreateRequest, user: AppUser = Depends(require_user)) -> MistakeQuestionResponse:
+    return save_question_figure_crops(batch_id, question_id, payload.file_id, [normalized_figure_box(payload)], user)
+
+
+@app.post("/api/mistakes/{batch_id}/questions/{question_id}/figures/ai", response_model=MistakeQuestionResponse, status_code=status.HTTP_201_CREATED)
+def auto_extract_question_figures(batch_id: str, question_id: str, payload: QuestionFigureAutoExtractRequest, user: AppUser = Depends(require_user)) -> MistakeQuestionResponse:
+    with SessionLocal() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        question = session.get(MistakeQuestion, question_id)
+        file = session.get(UploadedFile, payload.file_id)
+        config = session.get(AiProviderConfig, user.id)
+        if question is None or question.batch_id != batch.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到这道题。")
+        if file is None or file.batch_id != batch.id or not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请选择这道错题的原始图片。")
+        if config is None or not config.model or not config.encrypted_api_key:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中填写接口地址、视觉模型和 API 密钥。")
+        session.expunge(config)
+        session.expunge(file)
+    try:
+        regions = parse_ai_figure_regions(call_ai_chat(config, build_ai_figure_messages(batch_id, file), max_tokens=800))
+    except RuntimeError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+    if not regions:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="AI 没有找到可保留的题图；可改用“手动截取题图”框选需要的区域。")
+    return save_question_figure_crops(batch_id, question_id, payload.file_id, regions, user)
 
 
 @app.get("/api/mistakes/{batch_id}/questions/{question_id}/figures/{figure_id}")

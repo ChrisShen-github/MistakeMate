@@ -233,6 +233,22 @@ class QuestionAnswerFile(Base):
     question: Mapped[MistakeQuestion] = relationship(back_populates="answer_files")
 
 
+class PracticeAttempt(Base):
+    """One self-reported result from a review session.
+
+    Attempts deliberately stay append-only: changing "still wrong" to "got it"
+    should preserve the learning trail instead of overwriting yesterday's result.
+    """
+
+    __tablename__ = "practice_attempts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("app_users.id"), index=True)
+    question_id: Mapped[str] = mapped_column(ForeignKey("mistake_questions.id"), index=True)
+    result: Mapped[str] = mapped_column(String(16))
+    practiced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
 class PrintTemplate(Base):
     __tablename__ = "print_templates"
 
@@ -508,6 +524,40 @@ class PrintableQuestionResponse(MistakeQuestionResponse):
     print_kind: str = "text"
     clean_image_file_id: str | None = None
     clean_image_name: str = ""
+
+
+class TodayTaskItemResponse(BaseModel):
+    question: MistakeQuestionResponse
+    batch_id: str
+    subject: str
+    source: str
+    priority_reason: str
+    completed_today: bool
+    today_result: str | None = None
+    total_attempts: int
+    correct_attempts: int
+    incorrect_attempts: int
+
+
+class TodayTaskResponse(BaseModel):
+    date: str
+    target_count: int
+    planned_count: int
+    completed_count: int
+    correct_count: int
+    incorrect_count: int
+    accuracy_rate: int | None = None
+    tasks: list[TodayTaskItemResponse]
+
+
+class PracticeAttemptCreateRequest(BaseModel):
+    result: str = Field(pattern="^(correct|incorrect)$")
+
+
+class PracticeAttemptResponse(BaseModel):
+    question_id: str
+    result: str
+    practiced_at: datetime
 
 
 class PrintTemplatePayload(BaseModel):
@@ -790,6 +840,122 @@ def to_question_response(question: MistakeQuestion) -> MistakeQuestionResponse:
         ],
         status=question.status,
         updated_at=question.updated_at,
+    )
+
+
+CHINA_TIMEZONE = timezone(timedelta(hours=8))
+DAILY_REVIEW_TARGET = 10
+
+
+def today_bounds() -> tuple[datetime, datetime, str]:
+    """Return the current calendar day in the product's China-time study day."""
+    local_now = datetime.now(CHINA_TIMEZONE)
+    local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    local_end = local_start + timedelta(days=1)
+    return local_start.astimezone(timezone.utc), local_end.astimezone(timezone.utc), local_now.date().isoformat()
+
+
+def as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def practice_priority(attempts: list[PracticeAttempt], now: datetime) -> tuple[float, str] | None:
+    """Choose questions that are due, with repeat mistakes noticeably first."""
+    if not attempts:
+        return 500.0, "新错题，先完整做一遍"
+
+    ordered = sorted(attempts, key=lambda item: item.practiced_at, reverse=True)
+    latest = ordered[0]
+    incorrect_count = sum(item.result == "incorrect" for item in ordered)
+    if latest.result == "incorrect":
+        age_hours = max(0.0, (now - as_utc(latest.practiced_at)).total_seconds() / 3600)
+        return 1000.0 + incorrect_count * 25 + min(age_hours, 240) / 10, "上次仍做错，优先再练"
+
+    correct_streak = 0
+    for item in ordered:
+        if item.result != "correct":
+            break
+        correct_streak += 1
+    review_days = (1, 3, 7, 14, 30)[min(correct_streak - 1, 4)]
+    due_at = as_utc(latest.practiced_at) + timedelta(days=review_days)
+    if due_at <= now:
+        overdue_days = max(0.0, (now - due_at).total_seconds() / 86400)
+        return 700.0 + overdue_days, f"记忆复习到期（第 {correct_streak + 1} 次）"
+    return None
+
+
+def build_today_tasks(session: Any, user_id: str) -> TodayTaskResponse:
+    start, end, date_label = today_bounds()
+    rows = session.execute(
+        select(MistakeQuestion, UploadBatch)
+        .join(UploadBatch, MistakeQuestion.batch_id == UploadBatch.id)
+        .where(MistakeQuestion.status == "confirmed", UploadBatch.owner_id == user_id)
+        .order_by(UploadBatch.created_at.asc(), MistakeQuestion.position.asc())
+    ).all()
+    question_ids = [question.id for question, _ in rows]
+    attempts_by_question: dict[str, list[PracticeAttempt]] = {question_id: [] for question_id in question_ids}
+    if question_ids:
+        attempts = session.scalars(
+            select(PracticeAttempt)
+            .where(PracticeAttempt.user_id == user_id, PracticeAttempt.question_id.in_(question_ids))
+            .order_by(PracticeAttempt.practiced_at.desc())
+        ).all()
+        for attempt in attempts:
+            attempts_by_question.setdefault(attempt.question_id, []).append(attempt)
+
+    latest_today: dict[str, PracticeAttempt] = {}
+    for question_id, attempts in attempts_by_question.items():
+        for attempt in attempts:
+            if start <= as_utc(attempt.practiced_at) < end:
+                latest_today[question_id] = attempt
+                break
+
+    now = datetime.now(timezone.utc)
+    completed_rows = [(question, batch) for question, batch in rows if question.id in latest_today]
+    pending_candidates: list[tuple[float, str, MistakeQuestion, UploadBatch]] = []
+    for question, batch in rows:
+        if question.id in latest_today:
+            continue
+        priority = practice_priority(attempts_by_question.get(question.id, []), now)
+        if priority is not None:
+            score, reason = priority
+            pending_candidates.append((score, reason, question, batch))
+    pending_candidates.sort(key=lambda item: (-item[0], item[2].updated_at))
+
+    remaining = max(0, DAILY_REVIEW_TARGET - len(completed_rows))
+    selected_pending = pending_candidates[:remaining]
+    selected: list[tuple[MistakeQuestion, UploadBatch, str]] = []
+    for question, batch in sorted(completed_rows, key=lambda item: latest_today[item[0].id].practiced_at):
+        result = latest_today[question.id].result
+        selected.append((question, batch, "今天已标记正确" if result == "correct" else "今天仍然做错"))
+    selected.extend((question, batch, reason) for _, reason, question, batch in selected_pending)
+
+    correct_count = sum(attempt.result == "correct" for attempt in latest_today.values())
+    incorrect_count = sum(attempt.result == "incorrect" for attempt in latest_today.values())
+    completed_count = len(latest_today)
+    return TodayTaskResponse(
+        date=date_label,
+        target_count=min(DAILY_REVIEW_TARGET, len(rows)),
+        planned_count=len(selected),
+        completed_count=completed_count,
+        correct_count=correct_count,
+        incorrect_count=incorrect_count,
+        accuracy_rate=round(correct_count * 100 / completed_count) if completed_count else None,
+        tasks=[
+            TodayTaskItemResponse(
+                question=to_question_response(question),
+                batch_id=batch.id,
+                subject=batch.subject,
+                source=batch.source,
+                priority_reason=reason,
+                completed_today=question.id in latest_today,
+                today_result=latest_today[question.id].result if question.id in latest_today else None,
+                total_attempts=len(attempts_by_question.get(question.id, [])),
+                correct_attempts=sum(item.result == "correct" for item in attempts_by_question.get(question.id, [])),
+                incorrect_attempts=sum(item.result == "incorrect" for item in attempts_by_question.get(question.id, [])),
+            )
+            for question, batch, reason in selected
+        ],
     )
 
 
@@ -1987,6 +2153,37 @@ def logout_user(response: Response) -> dict[str, str]:
 @app.get("/api/auth/me", response_model=UserResponse)
 def current_user(user: AppUser = Depends(require_user)) -> UserResponse:
     return to_user_response(user)
+
+
+@app.get("/api/tasks/today", response_model=TodayTaskResponse)
+def get_today_tasks(user: AppUser = Depends(require_user)) -> TodayTaskResponse:
+    with SessionLocal() as session:
+        return build_today_tasks(session, user.id)
+
+
+@app.post("/api/tasks/today/questions/{question_id}/attempts", response_model=PracticeAttemptResponse, status_code=status.HTTP_201_CREATED)
+def create_practice_attempt(
+    question_id: str,
+    payload: PracticeAttemptCreateRequest,
+    user: AppUser = Depends(require_user),
+) -> PracticeAttemptResponse:
+    with SessionLocal.begin() as session:
+        question = session.execute(
+            select(MistakeQuestion)
+            .join(UploadBatch, MistakeQuestion.batch_id == UploadBatch.id)
+            .where(MistakeQuestion.id == question_id, MistakeQuestion.status == "confirmed", UploadBatch.owner_id == user.id)
+        ).scalar_one_or_none()
+        if question is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到可复习的题目。")
+        attempt = PracticeAttempt(
+            id=str(uuid4()),
+            user_id=user.id,
+            question_id=question.id,
+            result=payload.result,
+            practiced_at=datetime.now(timezone.utc),
+        )
+        session.add(attempt)
+    return PracticeAttemptResponse(question_id=question_id, result=attempt.result, practiced_at=attempt.practiced_at)
 
 
 def to_preference_response(preference: UserPreference | None) -> PreferenceResponse:

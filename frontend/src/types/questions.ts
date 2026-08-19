@@ -37,3 +37,27 @@ export type MistakeQuestion = {
   status: string
   updated_at: string
 }
+
+export type TodayTask = {
+  question: MistakeQuestion
+  batch_id: string
+  subject: string
+  source: string
+  priority_reason: string
+  completed_today: boolean
+  today_result: 'correct' | 'incorrect' | null
+  total_attempts: number
+  correct_attempts: number
+  incorrect_attempts: number
+}
+
+export type TodayTasks = {
+  date: string
+  target_count: number
+  planned_count: number
+  completed_count: number
+  correct_count: number
+  incorrect_count: number
+  accuracy_rate: number | null
+  tasks: TodayTask[]
+}

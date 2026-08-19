@@ -249,6 +249,21 @@ class PracticeAttempt(Base):
     practiced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
+class HermesAccessToken(Base):
+    """A narrow, revocable bearer token for a user's external study assistant."""
+
+    __tablename__ = "hermes_access_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("app_users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(80), default="Hermes")
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    token_prefix: Mapped[str] = mapped_column(String(24))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class PrintTemplate(Base):
     __tablename__ = "print_templates"
 
@@ -560,6 +575,30 @@ class PracticeAttemptResponse(BaseModel):
     practiced_at: datetime
 
 
+class HermesTokenCreateRequest(BaseModel):
+    name: str = Field(default="Hermes", min_length=1, max_length=80)
+
+
+class HermesTokenResponse(BaseModel):
+    id: str
+    name: str
+    token_prefix: str
+    created_at: datetime
+    last_used_at: datetime | None
+    revoked_at: datetime | None
+
+
+class HermesTokenCreateResponse(HermesTokenResponse):
+    token: str
+
+
+class HermesQuestionResponse(BaseModel):
+    question: MistakeQuestionResponse
+    batch_id: str
+    subject: str
+    source: str
+
+
 class PrintTemplatePayload(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     settings: dict[str, Any]
@@ -694,6 +733,30 @@ def require_user(request: Request) -> AppUser:
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录。")
 
 
+def token_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def require_hermes_user(request: Request) -> AppUser:
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="需要 Hermes 访问令牌。", headers={"WWW-Authenticate": "Bearer"})
+    digest = token_digest(token.strip())
+    with SessionLocal.begin() as session:
+        access_token = session.scalar(
+            select(HermesAccessToken).where(HermesAccessToken.token_hash == digest, HermesAccessToken.revoked_at.is_(None))
+        )
+        if access_token is None or not hmac.compare_digest(access_token.token_hash, digest):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Hermes 访问令牌无效或已撤销。", headers={"WWW-Authenticate": "Bearer"})
+        user = session.get(AppUser, access_token.user_id)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="关联账户不存在。")
+        access_token.last_used_at = datetime.now(timezone.utc)
+        session.expunge(user)
+        return user
+
+
 def set_session_cookie(response: Response, user_id: str, request: Request) -> None:
     response.set_cookie(
         SESSION_COOKIE,
@@ -777,6 +840,17 @@ def to_uploaded_file_response(file: UploadedFile, clean_image: CleanImage | None
         content_type=file.content_type,
         size=file.size,
         clean_image=None if clean_image is None else CleanImageResponse(id=clean_image.source_file_id, created_at=clean_image.created_at, approved_at=clean_image.approved_at),
+    )
+
+
+def to_hermes_token_response(token: HermesAccessToken) -> HermesTokenResponse:
+    return HermesTokenResponse(
+        id=token.id,
+        name=token.name,
+        token_prefix=token.token_prefix,
+        created_at=token.created_at,
+        last_used_at=token.last_used_at,
+        revoked_at=token.revoked_at,
     )
 
 
@@ -2155,6 +2229,40 @@ def current_user(user: AppUser = Depends(require_user)) -> UserResponse:
     return to_user_response(user)
 
 
+@app.get("/api/settings/hermes-tokens", response_model=list[HermesTokenResponse])
+def list_hermes_tokens(user: AppUser = Depends(require_user)) -> list[HermesTokenResponse]:
+    with SessionLocal() as session:
+        tokens = session.scalars(
+            select(HermesAccessToken).where(HermesAccessToken.user_id == user.id).order_by(HermesAccessToken.created_at.desc())
+        ).all()
+        return [to_hermes_token_response(token) for token in tokens]
+
+
+@app.post("/api/settings/hermes-tokens", response_model=HermesTokenCreateResponse, status_code=status.HTTP_201_CREATED)
+def create_hermes_token(payload: HermesTokenCreateRequest, user: AppUser = Depends(require_user)) -> HermesTokenCreateResponse:
+    raw_token = f"mmh_{secrets.token_urlsafe(32)}"
+    with SessionLocal.begin() as session:
+        token = HermesAccessToken(
+            id=str(uuid4()),
+            user_id=user.id,
+            name=payload.name.strip() or "Hermes",
+            token_hash=token_digest(raw_token),
+            token_prefix=f"{raw_token[:12]}…",
+        )
+        session.add(token)
+    return HermesTokenCreateResponse(**to_hermes_token_response(token).model_dump(), token=raw_token)
+
+
+@app.delete("/api/settings/hermes-tokens/{token_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_hermes_token(token_id: str, user: AppUser = Depends(require_user)) -> Response:
+    with SessionLocal.begin() as session:
+        token = session.scalar(select(HermesAccessToken).where(HermesAccessToken.id == token_id, HermesAccessToken.user_id == user.id))
+        if token is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到该 Hermes 访问令牌。")
+        token.revoked_at = datetime.now(timezone.utc)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @app.get("/api/tasks/today", response_model=TodayTaskResponse)
 def get_today_tasks(user: AppUser = Depends(require_user)) -> TodayTaskResponse:
     with SessionLocal() as session:
@@ -2184,6 +2292,35 @@ def create_practice_attempt(
         )
         session.add(attempt)
     return PracticeAttemptResponse(question_id=question_id, result=attempt.result, practiced_at=attempt.practiced_at)
+
+
+@app.get("/api/integrations/hermes/tasks/today", response_model=TodayTaskResponse)
+def hermes_today_tasks(user: AppUser = Depends(require_hermes_user)) -> TodayTaskResponse:
+    with SessionLocal() as session:
+        return build_today_tasks(session, user.id)
+
+
+@app.get("/api/integrations/hermes/questions/{question_id}", response_model=HermesQuestionResponse)
+def hermes_get_question(question_id: str, user: AppUser = Depends(require_hermes_user)) -> HermesQuestionResponse:
+    with SessionLocal() as session:
+        row = session.execute(
+            select(MistakeQuestion, UploadBatch)
+            .join(UploadBatch, MistakeQuestion.batch_id == UploadBatch.id)
+            .where(MistakeQuestion.id == question_id, MistakeQuestion.status == "confirmed", UploadBatch.owner_id == user.id)
+        ).one_or_none()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到可复习的题目。")
+        question, batch = row
+        return HermesQuestionResponse(question=to_question_response(question), batch_id=batch.id, subject=batch.subject, source=batch.source)
+
+
+@app.post("/api/integrations/hermes/questions/{question_id}/attempts", response_model=PracticeAttemptResponse, status_code=status.HTTP_201_CREATED)
+def hermes_create_practice_attempt(
+    question_id: str,
+    payload: PracticeAttemptCreateRequest,
+    user: AppUser = Depends(require_hermes_user),
+) -> PracticeAttemptResponse:
+    return create_practice_attempt(question_id, payload, user)
 
 
 def to_preference_response(preference: UserPreference | None) -> PreferenceResponse:

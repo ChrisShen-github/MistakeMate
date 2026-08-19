@@ -48,6 +48,7 @@ const settingsReturnView = ref<AppView>('dashboard')
 const previousView = ref<'dashboard' | 'library'>('dashboard')
 const previousPrintView = ref<'dashboard' | 'library'>('dashboard')
 const activeBatchId = ref('')
+const requestedPrintQuestionIds = ref<string[]>([])
 const sidebarOpen = ref(false)
 const notice = ref('')
 const authLoading = ref(true)
@@ -85,7 +86,8 @@ function openBatch(batchId: string) {
   currentView.value = 'review'
 }
 
-function openPrint() {
+function openPrint(questionIds: string[] = []) {
+  requestedPrintQuestionIds.value = questionIds
   previousPrintView.value = currentView.value === 'library' ? 'library' : 'dashboard'
   activeNav.value = '错题集'
   currentView.value = 'print'
@@ -93,6 +95,7 @@ function openPrint() {
 }
 
 function closePrint() {
+  requestedPrintQuestionIds.value = []
   if (previousPrintView.value === 'library') {
     openLibrary()
   } else {
@@ -119,7 +122,12 @@ function onRecognitionQueued(count: number) {
 
 function onAuthenticated(user: SignedInUser) {
   currentUser.value = user
-  currentView.value = 'dashboard'
+  const printIds = new URLSearchParams(window.location.search).get('print')?.split(',').filter(Boolean) || []
+  if (printIds.length) {
+    requestedPrintQuestionIds.value = printIds
+    activeNav.value = '错题集'
+    currentView.value = 'print'
+  } else currentView.value = 'dashboard'
 }
 
 function onProfileUpdated(user: SignedInUser) {
@@ -164,7 +172,15 @@ async function logout() {
 onMounted(async () => {
   try {
     const response = await fetch('/api/auth/me')
-    if (response.ok) currentUser.value = await response.json()
+    if (response.ok) {
+      currentUser.value = await response.json()
+      const printIds = new URLSearchParams(window.location.search).get('print')?.split(',').filter(Boolean) || []
+      if (printIds.length) {
+        requestedPrintQuestionIds.value = printIds
+        activeNav.value = '错题集'
+        currentView.value = 'print'
+      }
+    }
   } finally {
     authLoading.value = false
   }
@@ -230,7 +246,7 @@ onMounted(async () => {
       <UploadWorkspace v-if="currentView === 'upload'" :notebook-name="`${currentUser.display_name}的错题本`" @back="closeUpload" @queued="onRecognitionQueued" @configure-ai="openAiSettings" />
       <MistakeLibrary v-else-if="currentView === 'library'" @upload="openUpload" @print="openPrint" @open="openBatch($event.id)" />
       <BatchReview v-else-if="currentView === 'review'" :batch-id="activeBatchId" @back="openLibrary" @configure-ai="openAiSettings" />
-      <PrintWorkspace v-else-if="currentView === 'print'" @back="closePrint" />
+      <PrintWorkspace v-else-if="currentView === 'print'" :initial-question-ids="requestedPrintQuestionIds" @back="closePrint" />
       <SettingsWorkspace v-else-if="currentView === 'settings'" :user="currentUser" @back="closeSettings" @logout="logout" @profile-updated="onProfileUpdated" />
       <AiSettingsWorkspace v-else-if="currentView === 'ai-settings'" @back="closeSettings" />
       <OcrModelSettingsWorkspace v-else-if="currentView === 'ocr-models'" @back="closeSettings" />

@@ -65,6 +65,7 @@ type PlacedQuestion = { question: PrintableQuestion; number: number; oversized: 
 type PrintPage = { columns: PlacedQuestion[][] }
 
 const emit = defineEmits<{ back: [] }>()
+const props = withDefaults(defineProps<{ initialQuestionIds?: string[] }>(), { initialQuestionIds: () => [] })
 
 const paperPresets: PaperPreset[] = [
   { id: 'A3', label: 'A3（297 × 420 mm）', width: 297, height: 420 },
@@ -349,7 +350,8 @@ async function loadData() {
     const questionPayload = await questionResponse.json().catch(() => ({ detail: '暂时无法读取可打印题目。' }))
     if (!questionResponse.ok) throw new Error(questionPayload.detail)
     questions.value = questionPayload
-    selectedIds.value = questionPayload.map((question: PrintableQuestion) => question.id)
+    const requestedIds = props.initialQuestionIds.filter((id) => questionPayload.some((question: PrintableQuestion) => question.id === id))
+    selectedIds.value = requestedIds.length ? requestedIds : questionPayload.map((question: PrintableQuestion) => question.id)
     questionPayload.forEach((question: PrintableQuestion) => adjustmentFor(question))
     if (templateResponse.ok) customTemplates.value = await templateResponse.json()
   } catch (error) {

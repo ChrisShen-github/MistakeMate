@@ -19,6 +19,30 @@ Compose 会直接拉取 `akwangdao/mistakemate:latest`，不需要本机构建�
 
 首次打开会创建 MistakeMate 账号。登录后可在侧栏分别打开“账户设置”“AI 设置”和“OCR 模型”。AI 设置中填写 OpenAI 兼容接口地址、视觉模型和 API 密钥；密钥会在服务端加密保存，不会回显到网页。认证签名和密钥加密所需的内部密钥会在首次启动时自动生成并保存在 PostgreSQL，不需要额外填写环境变量。
 
+## Hermes 助手控制
+
+“账户设置”底部的 **Hermes 控制** 可以创建独立访问令牌。令牌仅显示一次，可随时撤销；它只能读取今日任务和已确认题目、记录“做对/做错”，以及准备指定题目的打印工作台链接，不能删除错题或修改账户。
+
+将仓库中的 `integrations/hermes-mcp/server.py` 放在运行 Hermes 的机器上，并在 Hermes 的 `config.yaml` 添加一个受限 MCP 服务：
+
+```yaml
+mcp_servers:
+  mistakemate:
+    command: python
+    args: ["/absolute/path/to/MistakeMate/integrations/hermes-mcp/server.py"]
+    env:
+      MISTAKEMATE_URL: "http://你的-MistakeMate-地址:8080"
+      MISTAKEMATE_TOKEN: "在账户设置中复制的 mmh_… 令牌"
+    tools:
+      include: [list_today_tasks, get_question, mark_attempt, prepare_print]
+      prompts: false
+      resources: false
+```
+
+这里的 `env` 是 Hermes 启动 MCP 时在本机传入的令牌，不是 MistakeMate Docker 配置，也不会写进镜像或数据库配置。把 `integrations/hermes-skill/` 复制到 `~/.hermes/skills/mistakemate-control/` 后，重开 Hermes 会话即可用 `/mistakemate-control`。
+
+`prepare_print` 会打开已选题目的 MistakeMate 打印工作台；它不会直接向实体打印机发纸。请在已登录的浏览器核对模板、纸张和份数，并明确确认后再打印。网络打印机和 USB 打印桥接会作为后续独立功能接入。
+
 ## 本地 OCR
 
 上传时默认选“AI 视觉识别”，也可以改为“本地 OCR”。本地 OCR 会在后台使用 PaddleOCR 3.7 和 PP-OCRv6，题图不会发送到第三方服务；AI 视觉识别会跳过 PaddleOCR，把题图发送给你在网页中配置的兼容 OpenAI 的视觉模型，更适合手写、公式和复杂版面。题目确认页与打印预览会把 AI 输出的标准 Markdown 表格转换为原生表格；原始文字仍可直接编辑。

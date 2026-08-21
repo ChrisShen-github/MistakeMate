@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { ArrowLeft, CheckCircle2, CircleAlert, Eraser, FileImage, FileText, ImageOff, Info, LoaderCircle, RefreshCw, ScanText, Sparkles, Trash2, WandSparkles, X } from '@lucide/vue'
+import { ArrowLeft, CheckCircle2, CircleAlert, Eraser, FileImage, FileText, ImageOff, Info, LoaderCircle, RefreshCw, Save, ScanText, Sparkles, Trash2, WandSparkles, X } from '@lucide/vue'
 import QuestionEditor from './QuestionEditor.vue'
 import ImageCropper, { type CropRegion } from './ImageCropper.vue'
 import type { MistakeQuestion } from '../types/questions'
@@ -8,7 +8,7 @@ import type { MistakeQuestion } from '../types/questions'
 type CleanImage = { id: string; created_at: string; approved_at: string | null }
 type UploadedFile = { id: string; original_name: string; content_type: string; size: number; clean_image: CleanImage | null }
 type OcrRun = { engine: string; status: string; text: string; error_message: string; started_at: string | null; completed_at: string | null; ai_status: string; ai_text: string; ai_error_message: string; ai_model: string; ai_started_at: string | null; ai_completed_at: string | null }
-type BatchDetail = { id: string; subject: string; source: string; note: string; status: string; created_at: string; file_count: number; files: UploadedFile[]; ocr: OcrRun | null; questions: MistakeQuestion[] }
+type BatchDetail = { id: string; subject: string; source: string; title: string; note: string; status: string; created_at: string; file_count: number; files: UploadedFile[]; ocr: OcrRun | null; questions: MistakeQuestion[] }
 
 const props = defineProps<{ batchId: string }>()
 const emit = defineEmits<{ back: []; 'configure-ai': [] }>()
@@ -28,6 +28,9 @@ const figureCropFile = ref<File | null>(null)
 const isSavingFigure = ref(false)
 const isAutoExtractingFigure = ref(false)
 const figureCaptureMode = ref<'manual' | 'ai'>('manual')
+const titleDraft = ref('')
+const isSavingTitle = ref(false)
+const titleFeedback = ref('')
 let refreshTimer: number | undefined
 
 const imageFiles = computed(() => batch.value?.files.filter((file) => file.content_type.startsWith('image/') && !['image/heic', 'image/heif'].includes(file.content_type)) ?? [])
@@ -39,8 +42,9 @@ function formatDate(value: string) { return new Intl.DateTimeFormat('zh-CN', { y
 function fileUrl(file: UploadedFile) { return `/api/mistakes/${props.batchId}/files/${file.id}` }
 function cleanImageUrl(file: UploadedFile) { return `/api/mistakes/${props.batchId}/files/${file.id}/clean-image` }
 function isAiRecognition(ocr?: OcrRun | null) { return ocr?.engine === 'AI 视觉识别' }
-function isCleanWorkflow(ocr?: OcrRun | null) { return ocr?.engine === '清洁原图' }
-function recognitionName(ocr?: OcrRun | null) { return isCleanWorkflow(ocr) ? '清洁原图' : isAiRecognition(ocr) ? 'AI 视觉识别' : '本地 OCR' }
+function isDirectImageWorkflow(ocr?: OcrRun | null) { return ocr?.engine === '直接保存题图' }
+function isCleanWorkflow(ocr?: OcrRun | null) { return ocr?.engine === '清洁原图' || isDirectImageWorkflow(ocr) }
+function recognitionName(ocr?: OcrRun | null) { return isDirectImageWorkflow(ocr) ? '直接保存题图' : isCleanWorkflow(ocr) ? '清洁原图' : isAiRecognition(ocr) ? 'AI 视觉识别' : '本地 OCR' }
 function ocrLabel(status?: string, ocr?: OcrRun | null) {
   const name = recognitionName(ocr)
   return ({ queued: `${name}等待中`, running: `${name}正在识别`, completed: `${name}已完成`, confirmed: '题目已确认', failed: `${name}识别失败`, cancelled: '识别已取消' } as Record<string, string>)[status ?? ''] ?? '尚未识别'
@@ -55,6 +59,7 @@ async function loadBatch() {
     const response = await fetch(`/api/mistakes/${props.batchId}`)
     const payload = await response.json().catch(() => ({ detail: '暂时无法读取这组错题。' }))
     if (!response.ok) throw new Error(payload.detail)
+    if (!batch.value || batch.value.id !== payload.id || !titleDraft.value) titleDraft.value = payload.title || ''
     batch.value = payload
     void loadAiAvailability()
   } catch (error) {
@@ -62,6 +67,30 @@ async function loadBatch() {
   } finally {
     isLoading.value = false
     scheduleRefresh()
+  }
+}
+
+async function saveBatchTitle() {
+  if (!batch.value || isSavingTitle.value) return
+  const nextTitle = titleDraft.value.trim()
+  if (!nextTitle) {
+    errorMessage.value = '标题不能为空；如不需要自定义，请保留系统生成的上传时间标题。'
+    return
+  }
+  isSavingTitle.value = true
+  titleFeedback.value = ''
+  errorMessage.value = ''
+  try {
+    const response = await fetch(`/api/mistakes/${props.batchId}/title`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: nextTitle }) })
+    const payload = await response.json().catch(() => ({ detail: '保存标题失败，请稍后重试。' }))
+    if (!response.ok) throw new Error(payload.detail)
+    batch.value.title = payload.title
+    titleDraft.value = payload.title
+    titleFeedback.value = '标题已保存。'
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '保存标题失败，请稍后重试。'
+  } finally {
+    isSavingTitle.value = false
   }
 }
 
@@ -302,7 +331,7 @@ onBeforeUnmount(clearRefreshTimer)
 
     <template v-else-if="batch">
       <header class="review-heading">
-        <div><p class="eyebrow">题目确认</p><h1 id="review-heading">{{ batch.subject }} · {{ batch.source }}错题</h1><p>上传于 {{ formatDate(batch.created_at) }}，共 {{ batch.file_count }} 个原始文件。</p></div>
+        <div><p class="eyebrow">题目确认</p><h1 id="review-heading">{{ batch.title || `${batch.subject} · ${batch.source}错题` }}</h1><p>上传于 {{ formatDate(batch.created_at) }}，共 {{ batch.file_count }} 个原始文件。</p><div v-if="batch.title" class="batch-title-edit"><label :for="`batch-title-${batch.id}`">错题标题<input :id="`batch-title-${batch.id}`" v-model="titleDraft" maxlength="120" /></label><button type="button" :disabled="isSavingTitle" @click="saveBatchTitle"><LoaderCircle v-if="isSavingTitle" class="spin" :size="15" /><Save v-else :size="15" />{{ isSavingTitle ? '保存中…' : '保存标题' }}</button><small v-if="titleFeedback" role="status">{{ titleFeedback }}</small></div></div>
         <span class="status-chip" :class="{ confirmed: batch.status === 'confirmed' }">{{ batch.status === 'confirmed' ? '题目已确认' : ocrLabel(batch.ocr?.status, batch.ocr) }}</span>
       </header>
 
@@ -339,6 +368,7 @@ onBeforeUnmount(clearRefreshTimer)
 
 <style scoped>
 .review-page { max-width: 1200px; margin: 0 auto; padding: 32px 44px 56px; }.back-button { display: inline-flex; align-items: center; gap: 7px; min-height: 44px; padding: 0; color: #315f9b; border: 0; background: transparent; font-size: 13px; font-weight: 700; }.review-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-top: 18px; }.eyebrow { margin: 0 0 7px; color: #7189a3; font-size: 12px; font-weight: 700; letter-spacing: .4px; }.review-heading h1 { margin: 0; color: #1e3553; font-size: 31px; letter-spacing: -.7px; }.review-heading p:last-child { margin: 10px 0 0; color: #687f97; font-size: 13px; }.status-chip,.section-heading > span { flex: 0 0 auto; padding: 5px 8px; color: #92651e; border-radius: 6px; background: #fff4d7; font-size: 11px; font-weight: 700; }.review-tip { display: flex; align-items: flex-start; gap: 11px; margin-top: 26px; padding: 17px; color: #405f80; border: 1px solid #cfe1f4; border-radius: 12px; background: #f5faff; }.review-tip > svg { flex: 0 0 auto; margin-top: 1px; color: #3975cf; }.review-tip > div { flex: 1; }.review-tip strong { font-size: 13px; }.review-tip p { margin: 5px 0 0; color: #66809a; font-size: 12px; line-height: 1.6; }.ocr-button,.ocr-failed button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 42px; padding: 9px 12px; color: #fff; border: 0; border-radius: 8px; background: #f97316; font-size: 12px; font-weight: 700; }.ocr-button:disabled { cursor: wait; opacity: .65; }.ocr-progress { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; min-height: 42px; color: #486a90; font-size: 12px; font-weight: 700; }.ocr-result,.ocr-failed,.preview-section,.file-section,.ocr-raw { margin-top: 27px; padding: 22px; background: #fff; border: 1px solid #dce5ef; border-radius: 13px; }.ocr-result pre,.ocr-raw pre { max-height: 330px; margin: 14px 0 0; padding: 15px; overflow: auto; color: #344e69; border-radius: 9px; background: #f6f9fc; font: 13px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }.ocr-raw { padding: 0; overflow: hidden; }.ocr-raw summary { min-height: 44px; padding: 14px 18px; color: #42617f; font-size: 13px; font-weight: 700; cursor: pointer; }.ocr-raw pre { margin: 0 16px 16px; }.empty-draft { margin: 0; color: #5d7690; font-size: 13px; }.ocr-failed { display: flex; align-items: flex-start; gap: 10px; color: #b04b3d; border-color: #f0d0ca; background: #fffaf9; }.ocr-failed > div { flex: 1; }.ocr-failed strong { color: #864034; font-size: 13px; }.ocr-failed p { margin: 5px 0 0; color: #8d625b; font-size: 12px; line-height: 1.55; }.ocr-failed button { color: #ad493b; background: #fff; border: 1px solid #e1aaa0; }.section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 17px; }.section-heading h2 { margin: 0; color: #29435f; font-size: 18px; }.section-heading > span { color: #527395; background: #eef5fd; }.image-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px; }.image-card { overflow: hidden; color: inherit; border: 1px solid #dfe8f1; border-radius: 10px; background: #fbfdff; text-decoration: none; transition: border-color .2s ease, box-shadow .2s ease; }.image-card:hover { border-color: #92b7e4; box-shadow: 0 5px 14px rgba(39,90,158,.1); }.image-card img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #eef3f8; }.image-card span { display: block; overflow: hidden; padding: 10px; color: #526d89; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }.file-list { display: grid; gap: 9px; }.file-list a { display: flex; align-items: center; gap: 11px; min-height: 62px; padding: 10px; color: inherit; border: 1px solid #e0e8f0; border-radius: 9px; text-decoration: none; transition: border-color .2s ease, background .2s ease; }.file-list a:hover { border-color: #a9c6e9; background: #f8fbff; }.file-icon { display: grid; width: 38px; height: 38px; place-items: center; color: #3975cf; background: #eaf3ff; border-radius: 9px; }.file-list div:last-child { display: grid; gap: 4px; min-width: 0; }.file-list strong { overflow: hidden; color: #36506c; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }.file-list small { color: #8092a4; font-size: 11px; }.note { display: grid; gap: 6px; margin: 18px 2px 0; color: #617891; font-size: 13px; line-height: 1.6; }.note strong { color: #3e5874; font-size: 12px; }.review-loading,.review-error { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 230px; margin-top: 20px; color: #5c748d; background: #fff; border: 1px solid #dce5ef; border-radius: 13px; }.review-error { justify-content: flex-start; padding: 24px; color: #ad4e40; }.review-error div { display: grid; gap: 5px; flex: 1; }.review-error strong { color: #394f68; }.review-error p { margin: 0; color: #6d8298; font-size: 13px; }.review-error button { display: inline-flex; align-items: center; gap: 6px; min-height: 40px; padding: 8px 11px; color: #2d64ba; border: 1px solid #b7cfed; border-radius: 8px; background: #fff; font-weight: 700; }.spin { animation: rotate .8s linear infinite; }@keyframes rotate { to { transform: rotate(360deg); } }@media (max-width: 760px) { .review-page { padding: 22px 17px 42px; }.review-heading { align-items: flex-start; flex-direction: column; gap: 12px; }.review-heading h1 { font-size: 27px; }.review-tip,.ocr-result,.ocr-failed,.preview-section,.file-section,.ocr-raw { margin-top: 18px; }.ocr-result,.ocr-failed,.preview-section,.file-section { padding: 17px; }.review-tip { flex-wrap: wrap; }.ocr-button,.ocr-progress { width: 100%; }.image-grid { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; }.review-error { align-items: flex-start; flex-wrap: wrap; }.review-error button { margin-left: 34px; } }@media (prefers-reduced-motion: reduce) { .spin { animation: none; }.image-card,.file-list a { transition: none; } }
+.batch-title-edit { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-top: 13px; }.batch-title-edit label { display: grid; gap: 5px; color: #607994; font-size: 11px; font-weight: 700; }.batch-title-edit input { width: min(340px,72vw); min-height: 40px; padding: 0 10px; color: #2d4662; border: 1px solid #cbd8e6; border-radius: 8px; background: #fff; font: inherit; font-size: 13px; }.batch-title-edit input:focus { border-color: #2563eb; outline: 3px solid rgba(37,99,235,.16); }.batch-title-edit button { display: inline-flex; min-height: 40px; align-items: center; justify-content: center; gap: 5px; padding: 8px 10px; color: #2c62ae; border: 1px solid #b9d0ef; border-radius: 8px; background: #f7fbff; font-size: 12px; font-weight: 700; cursor: pointer; }.batch-title-edit button:disabled { cursor: wait; opacity: .6; }.batch-title-edit small { padding-bottom: 12px; color: #287158; font-size: 11px; font-weight: 700; }
 .status-chip.confirmed { color: #23785d; background: #e8f7f0; }
 .figure-source-picker { display: grid; grid-template-columns: 1fr auto; gap: 12px; margin-top: 20px; padding: 18px; border: 1px solid #b9d7f1; border-radius: 12px; background: #f6fbff; }.figure-source-picker h2 { margin: 0; color: #294f78; font-size: 17px; }.figure-source-picker p:last-child { margin: 6px 0 0; color: #617b95; font-size: 12px; line-height: 1.55; }.figure-source-picker > button { align-self: start; min-height: 40px; padding: 8px 11px; color: #526e89; border: 1px solid #c9d9e8; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 700; cursor: pointer; }.figure-source-picker > button:disabled,.figure-source-list button:disabled { cursor: wait; opacity: .6; }.figure-extracting { display: flex; grid-column: 1 / -1; align-items: center; gap: 7px; margin: 0; padding: 11px; color: #6547bc; border: 1px solid #ded5fb; border-radius: 8px; background: #fbfaff; font-size: 12px; font-weight: 700; }.figure-source-list { display: grid; grid-column: 1 / -1; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; }.figure-source-list button { display: grid; min-width: 0; overflow: hidden; padding: 0; color: #496784; border: 1px solid #d5e3ef; border-radius: 9px; background: #fff; text-align: left; cursor: pointer; transition: border-color .18s ease, box-shadow .18s ease; }.figure-source-list button:hover { border-color: #6fa1dc; box-shadow: 0 3px 10px rgba(45,94,157,.12); }.figure-source-list img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #e8eef4; }.figure-source-list span { overflow: hidden; padding: 8px; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }@media (max-width: 760px) { .figure-source-picker { grid-template-columns: 1fr; }.figure-source-picker > button { width: 100%; }.figure-source-list { grid-template-columns: repeat(2,minmax(0,1fr)); } }@media (prefers-reduced-motion: reduce) { .figure-source-list button { transition: none; } }
 .ai-assist-card { margin-top: 27px; padding: 20px 22px; color: #385571; border: 1px solid #ddd4f7; border-radius: 13px; background: #fbfaff; }

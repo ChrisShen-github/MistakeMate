@@ -6,6 +6,7 @@ type MistakeBatch = {
   id: string
   subject: string
   source: string
+  title: string
   note: string
   status: string
   created_at: string
@@ -172,7 +173,7 @@ onMounted(loadBatches)
       <article v-for="batch in batches" v-else :key="batch.id" class="batch-card">
         <div class="batch-icon"><Image :size="22" /></div>
         <div class="batch-main">
-          <div class="batch-title"><span class="subject-chip">{{ batch.subject }}</span><strong>{{ batch.source }}错题</strong><span class="status-chip" :class="batch.status">{{ statusLabel(batch.status) }}</span></div>
+          <div class="batch-title"><span class="subject-chip">{{ batch.subject }}</span><strong>{{ batch.title || `${batch.source}错题` }}</strong><span class="status-chip" :class="batch.status">{{ statusLabel(batch.status) }}</span></div>
           <p>{{ batch.note || '暂未填写备注，可在识别结果出来后补充。' }}</p>
           <small>{{ formatDate(batch.created_at) }} · {{ batch.file_count }} 个文件</small>
         </div>

@@ -100,6 +100,7 @@ class UploadBatch(Base):
     owner_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     subject: Mapped[str] = mapped_column(String(32))
     source: Mapped[str] = mapped_column(String(32))
+    title: Mapped[str] = mapped_column(String(120), default="")
     note: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(32), default="queued")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -305,6 +306,7 @@ class MistakeBatchResponse(BaseModel):
     id: str
     subject: str
     source: str
+    title: str
     note: str
     status: str
     created_at: datetime
@@ -529,6 +531,10 @@ class MistakeBatchDetailResponse(MistakeBatchResponse):
     files: list[UploadedFileResponse]
     ocr: OcrRunResponse | None
     questions: list[MistakeQuestionResponse]
+
+
+class BatchTitleUpdateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
 
 
 class PrintableQuestionResponse(MistakeQuestionResponse):
@@ -927,6 +933,10 @@ def today_bounds() -> tuple[datetime, datetime, str]:
     local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     local_end = local_start + timedelta(days=1)
     return local_start.astimezone(timezone.utc), local_end.astimezone(timezone.utc), local_now.date().isoformat()
+
+
+def default_image_batch_title() -> str:
+    return f"题图 · {datetime.now(CHINA_TIMEZONE).strftime('%Y-%m-%d %H:%M')}"
 
 
 def as_utc(value: datetime) -> datetime:
@@ -1493,6 +1503,29 @@ def prepare_ocr_inputs(
     return [source]
 
 
+def save_cropped_image(source: Path, destination: Path, crop_region: tuple[float, float, float, float] | None = None) -> None:
+    """Save an upload-ready PNG, optionally replacing the full source with its chosen crop."""
+    if source.suffix.lower() in {".heic", ".heif"}:
+        from pillow_heif import register_heif_opener
+
+        register_heif_opener()
+    from PIL import Image, ImageOps
+
+    with Image.open(source) as image:
+        prepared = ImageOps.exif_transpose(image)
+        if crop_region is not None:
+            x, y, width, height = crop_region
+            prepared = prepared.crop((
+                round(prepared.width * x),
+                round(prepared.height * y),
+                round(prepared.width * (x + width)),
+                round(prepared.height * (y + height)),
+            ))
+        if prepared.mode not in {"RGB", "RGBA"}:
+            prepared = prepared.convert("RGB")
+        prepared.save(destination, "PNG")
+
+
 def parse_crop_regions(value: str, file_count: int) -> list[tuple[float, float, float, float] | None]:
     try:
         payload = json.loads(value)
@@ -1663,6 +1696,7 @@ def split_upload_batch_by_file(batch_id: str, user_id: str) -> list[str]:
         batch_values = {
             "subject": batch.subject,
             "source": batch.source,
+            "title": batch.title,
             "note": batch.note,
             "created_at": batch.created_at,
         }
@@ -1699,6 +1733,7 @@ def split_upload_batch_by_file(batch_id: str, user_id: str) -> list[str]:
                     owner_id=user_id,
                     subject=batch_values["subject"],
                     source=batch_values["source"],
+                    title=batch_values["title"],
                     note=batch_values["note"],
                     status="queued",
                     created_at=batch_values["created_at"],
@@ -2108,7 +2143,7 @@ def run_clean_image_workflow(batch_id: str, user_id: str) -> None:
 def ensure_legacy_columns() -> None:
     schema = inspect(engine)
     migrations = {
-        "upload_batches": [("owner_id", "VARCHAR(36)")],
+        "upload_batches": [("owner_id", "VARCHAR(36)"), ("title", "VARCHAR(120) NOT NULL DEFAULT ''")],
         "print_templates": [("user_id", "VARCHAR(36)")],
         "ocr_runs": [
             ("ai_status", "VARCHAR(32) NOT NULL DEFAULT 'not_requested'"),
@@ -2501,6 +2536,7 @@ def list_mistakes(subject: str | None = None, user: AppUser = Depends(require_us
             id=batch.id,
             subject=batch.subject,
             source=batch.source,
+            title=batch.title,
             note=batch.note,
             status=batch.status,
             created_at=batch.created_at,
@@ -2702,6 +2738,7 @@ def get_mistake_batch(batch_id: str, user: AppUser = Depends(require_user)) -> M
         id=batch.id,
         subject=batch.subject,
         source=batch.source,
+        title=batch.title,
         note=batch.note,
         status=batch.status,
         created_at=batch.created_at,
@@ -3161,6 +3198,27 @@ def cancel_ocr(batch_id: str, user: AppUser = Depends(require_user)) -> OcrRunRe
     return to_ocr_response(run)
 
 
+@app.put("/api/mistakes/{batch_id}/title", response_model=MistakeBatchResponse)
+def update_mistake_batch_title(batch_id: str, payload: BatchTitleUpdateRequest, user: AppUser = Depends(require_user)) -> MistakeBatchResponse:
+    next_title = payload.title.strip()
+    if not next_title:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="标题不能为空。")
+    with SessionLocal.begin() as session:
+        batch = get_owned_batch(session, batch_id, user.id)
+        batch.title = next_title
+        session.flush()
+        return MistakeBatchResponse(
+            id=batch.id,
+            subject=batch.subject,
+            source=batch.source,
+            title=batch.title,
+            note=batch.note,
+            status=batch.status,
+            created_at=batch.created_at,
+            file_count=len(batch.files),
+        )
+
+
 @app.delete("/api/mistakes/{batch_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_mistake_batch(batch_id: str, user: AppUser = Depends(require_user)) -> Response:
     batch_directory = storage_root / "uploads" / batch_id
@@ -3286,6 +3344,7 @@ async def create_upload(
     user: AppUser = Depends(require_user),
     subject: str = Form(..., min_length=1, max_length=32),
     source: str = Form(..., min_length=1, max_length=32),
+    title: str = Form("", max_length=120),
     note: str = Form("", max_length=2000),
     workflow: str = Form("text", max_length=16),
     recognition_mode: str = Form("local", max_length=16),
@@ -3297,18 +3356,20 @@ async def create_upload(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请至少上传一个文件。")
     if len(files) > MAX_FILES_PER_BATCH:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"一次最多上传 {MAX_FILES_PER_BATCH} 个文件。")
-    if workflow not in {"text", "clean"}:
+    if workflow not in {"text", "clean", "image"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="上传流程不正确。")
     if recognition_mode not in {"local", "ai"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="识别方式不正确。")
-    if workflow == "clean":
-        image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+    image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+    if workflow in {"clean", "image"}:
         if any(Path(uploaded.filename or "").suffix.lower() not in image_extensions for uploaded in files):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="清洁原图流程暂不支持 PDF，请改为上传图片。")
-        with SessionLocal() as session:
-            config = session.get(AiProviderConfig, user.id)
-            if config is None or not config.image_edit_model or not config.encrypted_api_key:
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中选择图片修复模型并保存 API 密钥。")
+            flow_name = "清洁原图" if workflow == "clean" else "直接保存题图"
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{flow_name}流程暂不支持 PDF，请改为上传图片。")
+        if workflow == "clean":
+            with SessionLocal() as session:
+                config = session.get(AiProviderConfig, user.id)
+                if config is None or not config.image_edit_model or not config.encrypted_api_key:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中选择图片修复模型并保存 API 密钥。")
     elif recognition_mode == "ai":
         with SessionLocal() as session:
             config = session.get(AiProviderConfig, user.id)
@@ -3316,6 +3377,8 @@ async def create_upload(
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先在 AI 设置中填写接口地址、视觉模型和 API 密钥。")
     parsed_crop_regions = parse_crop_regions(crop_regions, len(files))
     parsed_merge_groups = parse_merge_groups(merge_groups, len(files))
+    if workflow == "image" and any(len(group) != 1 for group in parsed_merge_groups):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="直接保存题图时请让每张图片独立成题。")
 
     batch_ids = [str(uuid4()) for _ in parsed_merge_groups]
     batch_by_file_index = {
@@ -3325,6 +3388,14 @@ async def create_upload(
     }
     batch_directories: list[Path] = []
     upload_records: list[tuple[str, UploadedFile, OcrRegion | None]] = []
+    direct_clean_records: list[tuple[str, str, str]] = []
+    normalized_title = title.strip() if workflow in {"clean", "image"} else ""
+    if workflow in {"clean", "image"} and not normalized_title:
+        normalized_title = default_image_batch_title()
+    batch_titles = {
+        batch_id: normalized_title if len(batch_ids) == 1 else f"{normalized_title} · {index + 1}"
+        for index, batch_id in enumerate(batch_ids)
+    }
 
     try:
         for batch_id in batch_ids:
@@ -3351,6 +3422,20 @@ async def create_upload(
                         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"文件超过 20 MB：{original_name}")
                     target.write(chunk)
             await uploaded.close()
+            region = parsed_crop_regions[file_index]
+            if region is not None:
+                cropped_name = f"{uuid4()}.png"
+                cropped_destination = batch_directory / cropped_name
+                try:
+                    save_cropped_image(destination, cropped_destination, region)
+                except Exception as error:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"无法裁剪图片：{original_name}") from error
+                destination.unlink(missing_ok=True)
+                stored_name = cropped_name
+                destination = cropped_destination
+                original_name = f"{Path(original_name).stem}-裁剪.png"
+                content_type = "image/png"
+                size = destination.stat().st_size
             file_record = UploadedFile(
                 id=str(uuid4()),
                 batch_id=batch_id,
@@ -3359,34 +3444,55 @@ async def create_upload(
                 content_type=content_type,
                 size=size,
             )
-            region = parsed_crop_regions[file_index]
+            # A selected crop is already the stored file.  Do not keep an OCR-only
+            # region or later recognition would crop the final image a second time.
             region_record = None
-            if region is not None:
-                region_record = OcrRegion(
-                    file_id=file_record.id,
-                    x=region[0],
-                    y=region[1],
-                    width=region[2],
-                    height=region[3],
-                )
             upload_records.append((batch_id, file_record, region_record))
+            if workflow == "image":
+                clean_directory = batch_directory / "clean"
+                clean_directory.mkdir(exist_ok=True)
+                clean_name = f"{uuid4()}.png"
+                try:
+                    save_cropped_image(destination, clean_directory / clean_name)
+                except Exception as error:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"无法保存题图：{original_name}") from error
+                direct_clean_records.append((batch_id, file_record.id, clean_name))
 
         with SessionLocal.begin() as session:
+            batches_by_id: dict[str, UploadBatch] = {}
             for batch_id in batch_ids:
                 batch = UploadBatch(
                     id=batch_id,
                     owner_id=user.id,
                     subject=subject.strip(),
                     source=source.strip(),
+                    title=batch_titles[batch_id],
                     note=note.strip(),
-                    status="queued",
+                    status="confirmed" if workflow == "image" else "queued",
                     files=[file_record for saved_batch_id, file_record, _ in upload_records if saved_batch_id == batch_id],
                 )
                 session.add(batch)
+                batches_by_id[batch_id] = batch
+            session.flush()
+            for batch_id, file_id, clean_name in direct_clean_records:
+                session.add(CleanImage(
+                    source_file_id=file_id,
+                    batch_id=batch_id,
+                    stored_name=clean_name,
+                    approved_at=datetime.now(timezone.utc),
+                ))
             session.flush()
             for batch_id in batch_ids:
-                engine = "清洁原图" if workflow == "clean" else ("AI 视觉识别" if recognition_mode == "ai" else "PaddleOCR PP-OCRv6")
-                session.add(OcrRun(batch_id=batch_id, engine=engine))
+                engine = "直接保存题图" if workflow == "image" else ("清洁原图" if workflow == "clean" else ("AI 视觉识别" if recognition_mode == "ai" else "PaddleOCR PP-OCRv6"))
+                session.add(OcrRun(
+                    batch_id=batch_id,
+                    engine=engine,
+                    status="completed" if workflow == "image" else "queued",
+                    completed_at=datetime.now(timezone.utc) if workflow == "image" else None,
+                ))
+            if workflow == "image":
+                for batch in batches_by_id.values():
+                    ensure_clean_image_questions(session, batch)
             for _, _, region_record in upload_records:
                 if region_record is not None:
                     session.add(region_record)
@@ -3402,8 +3508,10 @@ async def create_upload(
     for batch_id in batch_ids:
         if workflow == "clean":
             background_tasks.add_task(run_clean_image_workflow, batch_id, user.id)
+        elif workflow == "image":
+            continue
         elif recognition_mode == "ai":
             background_tasks.add_task(run_direct_ai_ocr, batch_id, user.id)
         else:
             background_tasks.add_task(run_ocr, batch_id)
-    return UploadResponse(id=batch_ids[0], status="queued", file_count=len(upload_records), batch_ids=batch_ids)
+    return UploadResponse(id=batch_ids[0], status="confirmed" if workflow == "image" else "queued", file_count=len(upload_records), batch_ids=batch_ids)

@@ -114,10 +114,12 @@ function selectNav(label: string) {
   sidebarOpen.value = false
 }
 
-function onRecognitionQueued(count: number) {
+function onRecognitionQueued(count: number, workflow: 'text' | 'clean' | 'image') {
   activeNav.value = '我的错题'
   currentView.value = 'library'
-  showNotice(`已创建 ${count} 组待处理错题，正在按所选流程处理。`)
+  showNotice(workflow === 'image'
+    ? `已保存 ${count} 道题目图片，可直接打印，也可以补充错题信息。`
+    : `已创建 ${count} 组待处理错题，正在按所选流程处理。`)
 }
 
 function onAuthenticated(user: SignedInUser) {

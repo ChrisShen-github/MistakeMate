@@ -192,15 +192,15 @@ async function save(status: 'draft' | 'confirmed') {
 <template>
   <article class="question-editor" :aria-labelledby="`question-${question.id}`">
     <header class="editor-heading">
-      <div><p class="eyebrow">题目 {{ question.position }} · {{ isImageOnly ? '清洁原图' : '可编辑初稿' }}</p><h2 :id="`question-${question.id}`">{{ isImageOnly ? '补充这道原题的信息' : '确认这道错题' }}</h2><p>{{ isImageOnly ? '题面以清洁图片保存和打印；在这里补充题型、错因、知识点和答案即可。' : '先核对 OCR 文字，再补充学习信息。原图始终保留在下方可对照。' }}</p></div>
+      <div><p class="eyebrow">题目 {{ question.position }} · {{ isImageOnly ? '原题图片' : '可编辑初稿' }}</p><h2 :id="`question-${question.id}`">{{ isImageOnly ? '补充这道原题的信息' : '确认这道错题' }}</h2><p>{{ isImageOnly ? '题面以原题图片保存和打印；在这里补充题型、错因、知识点和答案即可。' : '先核对 OCR 文字，再补充学习信息。原图始终保留在下方可对照。' }}</p></div>
       <span class="draft-chip" :class="{ confirmed: question.status === 'confirmed' }">{{ question.status === 'confirmed' ? '已确认' : '待确认' }}</span>
     </header>
 
     <p v-if="saveError" class="editor-error" role="alert"><CircleAlert :size="17" />{{ saveError }}</p>
     <p v-else-if="feedback" class="editor-success" role="status" aria-live="polite"><CheckCircle2 :size="17" />{{ feedback }}</p>
-    <p class="answer-optional-note"><FileText :size="17" /><span><strong>答案不是必填项</strong>{{ isImageOnly ? '清洁图就是完整题面；可先补充题型和错因，答案以后再拍照或填写。' : '只要题干和小问完整，就能确认并用于练习版打印；答案以后可以随时补充。' }}</span></p>
+    <p class="answer-optional-note"><FileText :size="17" /><span><strong>答案不是必填项</strong>{{ isImageOnly ? '原题图片就是完整题面；可先补充题型和错因，答案以后再拍照或填写。' : '只要题干和小问完整，就能确认并用于练习版打印；答案以后可以随时补充。' }}</span></p>
 
-    <section v-if="isImageOnly && question.clean_source_file_id" class="clean-source-section" aria-label="清洁原题"><div><strong>清洁原题</strong><small>这张图会直接用于打印；题目文字不会被 OCR 改写。</small></div><img :src="`/api/mistakes/${batchId}/files/${question.clean_source_file_id}/clean-image`" alt="清洁原题" /></section>
+    <section v-if="isImageOnly && question.clean_source_file_id" class="clean-source-section" aria-label="原题图片"><div><strong>原题图片</strong><small>这张图会直接用于打印；题目文字不会被 OCR 改写。</small></div><img :src="`/api/mistakes/${batchId}/files/${question.clean_source_file_id}/clean-image`" alt="原题图片" /></section>
 
     <section v-if="!isImageOnly" class="figure-section" aria-label="题图">
       <div><strong>题图</strong><small>坐标轴、几何图、统计图等会随题目打印。AI 可先自动找图；边界不准时再手动截取。</small></div>

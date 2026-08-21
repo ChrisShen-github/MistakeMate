@@ -503,7 +503,7 @@ onBeforeUnmount(() => document.querySelector('#mistakemate-print-page')?.remove(
                         <span v-if="settings.showDifficulty && !isCleanOriginal(item.question)">难度 {{ '★'.repeat(item.question.difficulty) }}</span>
                         <span v-if="settings.showDate">{{ formatDate(item.question.batch_created_at) }}</span>
                       </div>
-                      <img v-if="isCleanOriginal(item.question)" class="print-clean-image" :src="cleanImageUrl(item.question)" :alt="`清洁原图：${item.question.clean_image_name}`" />
+                      <img v-if="isCleanOriginal(item.question)" class="print-clean-image" :src="cleanImageUrl(item.question)" :alt="`题目原图：${item.question.clean_image_name}`" />
                       <template v-else>
                       <QuestionText class="question-stem" :text="item.question.stem" />
                       <div v-if="item.question.figures.length" class="question-figures"><img v-for="figure in item.question.figures" :key="figure.id" :src="figureUrl(item.question, figure.id)" alt="题目图形" /></div>
